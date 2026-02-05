@@ -43,10 +43,10 @@ IPC_FILLS = "ipc:///tmp/polymarket_fills.ipc"     # Recebe fills do User Channel
 
 # Parâmetros de trading
 TRADE_SIZE = 5           # Tamanho de cada quote
-MAX_POSITION = 25        # Posição máxima (YES - NO)
+MAX_POSITION = 20        # Posição máxima (YES - NO)
 SPREAD_BASE = 0.02       # Spread base (1 cent cada lado)
 SKEW_FACTOR = 0.001      # Fator de skew por unidade de posição
-
+    
 # Intervalos de tempo (em minutos no período de 15min)
 NO_TRADE_START = 0.5     # Não opera nos primeiros 30s
 NO_TRADE_END = 14.5      # Não opera depois de 14:30
@@ -55,7 +55,7 @@ NO_TRADE_END = 14.5      # Não opera depois de 14:30
 TICK_SIZE = Decimal("0.01")
 
 # DEBUG: Para de colocar ordens após primeiro cancel (para testar se posição atualiza)
-DEBUG_STOP_AFTER_CANCEL = True
+DEBUG_STOP_AFTER_CANCEL = False
 
 
 # ============================================================
