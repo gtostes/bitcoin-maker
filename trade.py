@@ -54,6 +54,9 @@ NO_TRADE_END = 14.5      # Não opera depois de 14:30
 # Tick size do Polymarket
 TICK_SIZE = Decimal("0.01")
 
+# DEBUG: Para de colocar ordens após primeiro cancel (para testar se posição atualiza)
+DEBUG_STOP_AFTER_CANCEL = True
+
 
 # ============================================================
 # HELPERS
@@ -154,6 +157,7 @@ class MarketMaker:
         self.period_start_time = None
         self.is_updating_quotes = False
         self.quotes_need_update = False
+        self.has_cancelled_once = False  # DEBUG: Flag para parar após primeiro cancel
         
         # Debounce
         self.last_quote_update = 0
@@ -252,6 +256,8 @@ class MarketMaker:
         
         bid = min(ref_price - 0.01 - 0.001*pos, best_bid)
         ask = max(ref_price + 0.01 - 0.001*pos, best_ask)
+        
+        IMPORTANTE: Garante que my_bid < best_ask e my_ask > best_bid para não virar taker!
         """
         if self.ref_price is None:
             return None, None
@@ -262,11 +268,19 @@ class MarketMaker:
         my_bid = self.ref_price - SPREAD_BASE - SKEW_FACTOR * pos
         my_ask = self.ref_price + SPREAD_BASE - SKEW_FACTOR * pos
         
-        # Aplica limites do mercado
+        # Aplica limites do mercado (não ultrapassar o melhor preço)
         if self.best_bid is not None:
             my_bid = min(my_bid, self.best_bid)
         if self.best_ask is not None:
             my_ask = max(my_ask, self.best_ask)
+        
+        # CRÍTICO: Garante que não vira taker!
+        # my_bid deve ser MENOR que best_ask (senão cruza e vira taker)
+        # my_ask deve ser MAIOR que best_bid (senão cruza e vira taker)
+        if self.best_ask is not None and my_bid >= self.best_ask:
+            my_bid = self.best_ask - 0.01
+        if self.best_bid is not None and my_ask <= self.best_bid:
+            my_ask = self.best_bid + 0.01
         
         # Arredonda para tick size
         my_bid = round_price(my_bid)
@@ -330,6 +344,16 @@ class MarketMaker:
             # Cancela ordens antigas apenas se algum preço mudou
             if self.active_orders:
                 await asyncio.to_thread(self.cancel_all_orders)
+                # DEBUG: Para de operar após primeiro cancel para testar se posição atualiza
+                if DEBUG_STOP_AFTER_CANCEL:
+                    self.has_cancelled_once = True
+                    print("🛑 DEBUG: Cancelou ordens. Parando de colocar novas ordens para debug.")
+                    return
+            
+            # DEBUG: Se já cancelou uma vez, não coloca mais ordens
+            if DEBUG_STOP_AFTER_CANCEL and self.has_cancelled_once:
+                print("🛑 DEBUG: Modo debug ativo - não colocando novas ordens")
+                return
             
             orders_placed = []
             
@@ -464,21 +488,21 @@ class MarketMaker:
         
         if side == 'BUY':
             self.pnl -= cost  # Gastei dinheiro comprando
-            if outcome_upper == 'YES':
+            if outcome_upper == 'UP':
                 self.pos_yes += size
-            elif outcome_upper == 'NO':
+            elif outcome_upper == 'DOWN':
                 self.pos_no += size
         elif side == 'SELL':
             self.pnl += cost  # Recebi dinheiro vendendo
-            if outcome_upper == 'YES':
+            if outcome_upper == 'UP':
                 self.pos_yes -= size
-            elif outcome_upper == 'NO':
+            elif outcome_upper == 'DOWN':
                 self.pos_no -= size
         
         self.total_traded += size
         
         # Calcula PnL total (realizado + não realizado)
-        mid_price = self.ref_price if self.ref_price else 0.5
+        mid_price = (self.best_bid + self.best_ask)/2
         unrealized = self.pos_yes * mid_price + self.pos_no * (1 - mid_price)
         total_pnl = self.pnl + unrealized
         
