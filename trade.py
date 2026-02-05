@@ -616,7 +616,7 @@ async def read_fills(zmq_context, maker: MarketMaker):
 async def status_printer(maker: MarketMaker):
     """Imprime status periodicamente"""
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
         
         if maker.ref_price is not None:
             tm_seconds = time.time() % 900
@@ -631,6 +631,7 @@ async def status_printer(maker: MarketMaker):
             print(
                 f"📊 ref={maker.ref_price:.4f} | "
                 f"quotes: {bid_str}/{ask_str} | "
+                f"bid/ask: {maker.best_bid:.2f}/{maker.best_ask:.2f} | "
                 f"pos: {maker.pos_yes:.1f}Y/{maker.pos_no:.1f}N (net={maker.position:.1f}) | "
                 f"pnl={maker.pnl:.2f} | "
                 f"t={t:.1f}min {can_trade}"
