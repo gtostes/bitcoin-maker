@@ -338,6 +338,7 @@ class UserWebSocket:
         my_price = None
         my_outcome = None
         my_side = None
+
         
         for maker_order in maker_orders:
             owner = maker_order.get('owner', '')
@@ -351,7 +352,10 @@ class UserWebSocket:
                 # Maker side: se eu sou maker e alguém comprou, eu estava vendendo e vice-versa
                 # O trade.side é do taker, então meu side é o oposto
                 taker_side = data.get('side', '')
-                my_side = 'SELL' if taker_side == 'BUY' else 'BUY'
+                taker_outcome = data.get('outcome', '')
+
+                if( taker_outcome != my_outcome): my_side = taker_side
+                else: my_side = 'SELL' if taker_side == 'BUY' else 'BUY'
         
         # Se tive match em alguma ordem minha
         if my_matched_amount > 0:
