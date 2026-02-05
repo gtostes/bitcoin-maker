@@ -370,6 +370,10 @@ class MarketMaker:
     
     def _can_trade(self) -> bool:
         """Verifica se pode operar no momento atual"""
+        # Não opera no primeiro período (period_start_time só é setado no reset_period)
+        if self.period_start_time is None:
+            return False
+        
         tm_seconds = time.time() % 900
         t = tm_seconds / 60
         return NO_TRADE_START <= t <= NO_TRADE_END
@@ -406,8 +410,10 @@ class MarketMaker:
     def on_price_15(self, new_price_15: float):
         """Processa atualização do price_15 (detecta mudança de período)"""
         if self.price_15 is None:
+            # Primeiro período - apenas salva o preço, não inicia trading
+            # period_start_time permanece None, então _can_trade() retorna False
             self.price_15 = new_price_15
-            self.period_start_time = time.time()
+            print(f"📊 Primeiro período detectado (price_15={new_price_15}). Aguardando próximo período para operar.")
             return
         
         if new_price_15 != self.price_15:
