@@ -449,12 +449,19 @@ class MarketMaker:
         
         outcome_upper = outcome.upper() if outcome else ''
         
+        # Atualiza posição e PnL
+        # Quando compro, gasto dinheiro (pnl diminui)
+        # Quando vendo, recebo dinheiro (pnl aumenta)
+        cost = price * size
+        
         if side == 'BUY':
+            self.pnl -= cost  # Gastei dinheiro comprando
             if outcome_upper == 'YES':
                 self.pos_yes += size
             elif outcome_upper == 'NO':
                 self.pos_no += size
         elif side == 'SELL':
+            self.pnl += cost  # Recebi dinheiro vendendo
             if outcome_upper == 'YES':
                 self.pos_yes -= size
             elif outcome_upper == 'NO':
@@ -462,9 +469,14 @@ class MarketMaker:
         
         self.total_traded += size
         
+        # Calcula PnL total (realizado + não realizado)
+        mid_price = self.ref_price if self.ref_price else 0.5
+        unrealized = self.pos_yes * mid_price + self.pos_no * (1 - mid_price)
+        total_pnl = self.pnl + unrealized
+        
         maker_str = "MAKER" if is_maker else "TAKER"
         print(f"💰 FILL [{maker_str}]: {side} {size} {outcome} @ {price:.4f}")
-        print(f"📊 Posição: YES={self.pos_yes:.2f} | NO={self.pos_no:.2f} | Net={self.position:.2f}")
+        print(f"📊 Posição: YES={self.pos_yes:.2f} | NO={self.pos_no:.2f} | PnL Total={total_pnl:.4f}")
         
         # Reseta preços para forçar recálculo (posição mudou, precisa de novos preços)
         self.current_bid_price = None
@@ -628,12 +640,17 @@ async def status_printer(maker: MarketMaker):
             
             can_trade = "✅" if maker._can_trade() else "❌"
             
+            # PnL total = realizado + não realizado
+            mid_price = maker.ref_price
+            unrealized = maker.pos_yes * mid_price + maker.pos_no * (1 - mid_price)
+            total_pnl = maker.pnl + unrealized
+            
             print(
                 f"📊 ref={maker.ref_price:.4f} | "
                 f"quotes: {bid_str}/{ask_str} | "
                 f"bid/ask: {maker.best_bid:.2f}/{maker.best_ask:.2f} | "
-                f"pos: {maker.pos_yes:.1f}Y/{maker.pos_no:.1f}N (net={maker.position:.1f}) | "
-                f"pnl={maker.pnl:.2f} | "
+                f"pos: {maker.pos_yes:.1f}Y/{maker.pos_no:.1f}N | "
+                f"pnl={total_pnl:.4f} | "
                 f"t={t:.1f}min {can_trade}"
             )
 
