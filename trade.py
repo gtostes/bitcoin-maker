@@ -239,6 +239,13 @@ class MarketMaker:
             print(f"❌ Erro ao colocar ordem: {e}")
             return None
     
+    async def wait_and_quote(self):
+        """Espera até poder operar e então coloca quotes iniciais"""
+        while not self._can_trade():
+            await asyncio.sleep(1.0)
+        print("⏰ Período de espera inicial passou, colocando quotes...")
+        await self.update_quotes()
+    
     def calculate_quotes(self) -> tuple[float | None, float | None]:
         """
         Calcula os preços de bid e ask baseado no ref_price e posição.
@@ -434,7 +441,8 @@ class MarketMaker:
             print("\n🔄 Novo período! Renovando token IDs...")
             self.update_token_ids()
             
-            asyncio.get_event_loop().call_later(2.0, lambda: asyncio.create_task(self.update_quotes()))
+            # Inicia task que espera até poder operar e então coloca quotes
+            asyncio.create_task(self.wait_and_quote())
     
     def on_fill(self, fill_data: dict):
         """Processa fill recebido do User Channel."""
