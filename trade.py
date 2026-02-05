@@ -44,7 +44,7 @@ IPC_FILLS = "ipc:///tmp/polymarket_fills.ipc"     # Recebe fills do User Channel
 # Parâmetros de trading
 TRADE_SIZE = 5           # Tamanho de cada quote
 MAX_POSITION = 25        # Posição máxima (YES - NO)
-SPREAD_BASE = 0.01       # Spread base (1 cent cada lado)
+SPREAD_BASE = 0.02       # Spread base (1 cent cada lado)
 SKEW_FACTOR = 0.001      # Fator de skew por unidade de posição
 
 # Intervalos de tempo (em minutos no período de 15min)
