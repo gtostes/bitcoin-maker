@@ -662,17 +662,21 @@ class MarketMakerV2:
             if side == 'BUY':
                 if outcome_upper == 'UP':
                     self.pos_yes += size
+                    self.pnl -= size * price
                     # Limpa completamente o estado da ordem
                     self.bid_order = OrderInfo()
                 elif outcome_upper == 'DOWN':
                     self.pos_no += size
+                    self.pnl -= size * price
                     # Limpa completamente o estado da ordem
                     self.ask_order = OrderInfo()
             elif side == 'SELL':
                 if outcome_upper == 'UP':
                     self.pos_yes -= size
+                    self.pnl += size * price
                 elif outcome_upper == 'DOWN':
                     self.pos_no -= size
+                    self.pnl += size * price
             
             self.total_traded += size
         
@@ -848,13 +852,16 @@ async def status_printer(maker: MarketMakerV2):
             mkt_bid_str = f"{maker.best_bid:.2f}" if maker.best_bid else "N/A"
             mkt_ask_str = f"{maker.best_ask:.2f}" if maker.best_ask else "N/A"
             
+            mkt_mid = (maker.best_bid + maker.best_ask) / 2 if maker.best_bid and maker.best_ask else None
+            mkt_pnl = maker.pnl + (maker.pos_yes * mkt_mid + maker.pos_no * (1 - mkt_mid)) if mkt_mid is not None else 0
+
             aprint(
                 f"📊 pred={maker.price_pred:.4f} | "
                 f"mkt: {mkt_bid_str}/{mkt_ask_str} | "
                 f"quotes: {bid_status}/{ask_status} | "
                 f"desired: {desired_bid_str}/{desired_ask_str} | "
                 f"pos: {maker.pos_yes:.1f}Y/{maker.pos_no:.1f}N ({pos:+.1f}) | "
-                f"pnl={maker.pnl:.2f} | "
+                f"pnl={mkt_pnl:.2f} | "
                 f"t={t:.1f}min {can_trade}"
             )
 
