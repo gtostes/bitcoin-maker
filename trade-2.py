@@ -57,7 +57,7 @@ MAX_POSITION = 25         # Posição máxima (YES - NO)
 SPREAD_QUOTE = 0.05       # Spread para colocar quote (5 cents cada lado)
 SPREAD_CANCEL = 0.035      # Spread para cancelar quote (3.5 cents cada lado)
 SKEW_FACTOR = 0.002       # Fator de skew por unidade de posição
-MAX_DISTANCE = 0.10       # Distância máxima do mercado para cancelar (10 cents)
+MAX_DISTANCE = 0.12       # Distância máxima do mercado para cancelar (12 cents)
 
 # Intervalos de tempo
 FISCALIZE_INTERVAL = 0.2  # Fiscaliza quotes a cada 200ms
@@ -69,7 +69,7 @@ TICK_SIZE = Decimal("0.01")
 
 
 # ============================================================
-# HELPERS
+# HELPERS§
 # ============================================================
 
 def round_price_down(price: float) -> float:
@@ -420,8 +420,13 @@ class MarketMakerV2:
         pos = self.position
         desired_bid = self.calculate_bid_price()
         
-        # Não quota se posição máxima atingida
+        # Não quota se posição máxima atingida ou preço inválido
         should_quote_bid = pos < MAX_POSITION and desired_bid is not None
+        
+        # Também não quota se estaria muito longe do mercado
+        if should_quote_bid and self.best_bid is not None:
+            if desired_bid < self.best_bid - MAX_DISTANCE:
+                should_quote_bid = False
         
         if self.bid_order.state == OrderState.ACTIVE:
             # Tem ordem ativa - verifica se precisa cancelar
@@ -472,8 +477,13 @@ class MarketMakerV2:
         pos = self.position
         desired_ask = self.calculate_ask_price()
         
-        # Não quota se posição mínima atingida
+        # Não quota se posição mínima atingida ou preço inválido
         should_quote_ask = pos > -MAX_POSITION and desired_ask is not None
+        
+        # Também não quota se estaria muito longe do mercado
+        if should_quote_ask and self.best_ask is not None:
+            if desired_ask > self.best_ask + MAX_DISTANCE:
+                should_quote_ask = False
         
         # Preço do NO = 1 - ask_price
         no_price = round_price_down(1 - desired_ask) if desired_ask else None
