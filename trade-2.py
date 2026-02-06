@@ -54,8 +54,8 @@ IPC_FILLS = "ipc:///tmp/polymarket_fills.ipc"     # Recebe fills do User Channel
 # Parâmetros de trading
 TRADE_SIZE = 5            # Tamanho de cada quote
 MAX_POSITION = 25         # Posição máxima (YES - NO)
-SPREAD_QUOTE = 0.05       # Spread para colocar quote (5 cents cada lado)
-SPREAD_CANCEL = 0.035      # Spread para cancelar quote (3.5 cents cada lado)
+SPREAD_QUOTE = 0.04       # Spread para colocar quote (4 cents cada lado)
+SPREAD_CANCEL = 0.025      # Spread para cancelar quote (2.5 cents cada lado)
 SKEW_FACTOR = 0.002       # Fator de skew por unidade de posição
 MAX_DISTANCE = 0.12       # Distância máxima do mercado para cancelar (12 cents)
 
