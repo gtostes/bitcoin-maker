@@ -29,7 +29,7 @@ import zmq
 import zmq.asyncio
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
 from py_clob_client.order_builder.constants import BUY, SELL
 from py_clob_client.constants import POLYGON
 from dotenv import load_dotenv
@@ -73,17 +73,60 @@ TICK_SIZE = Decimal("0.01")
 # ASYNC PRINT (não bloqueia o event loop)
 # ============================================================
 
+import datetime
+from pathlib import Path
+
 _print_queue: asyncio.Queue = None
+_log_file = None
+_current_id_time = None
+
+def _get_id_time() -> int:
+    """Retorna o id_time do período atual de 15min"""
+    return 900 * int(time.time() // 900)
+
+def _ensure_log_file():
+    """Garante que o arquivo de log está aberto para o período atual"""
+    global _log_file, _current_id_time
+    
+    id_time = _get_id_time()
+    
+    # Se mudou de período, fecha o arquivo antigo e abre novo
+    if id_time != _current_id_time:
+        if _log_file is not None:
+            try:
+                _log_file.close()
+            except:
+                pass
+        
+        # Cria diretório se não existir
+        log_dir = Path(__file__).parent / "data"
+        log_dir.mkdir(exist_ok=True)
+        
+        log_path = log_dir / f"logs-{id_time}.txt"
+        _log_file = open(log_path, "a", buffering=1)  # Line buffered
+        _current_id_time = id_time
+        
+        # Marca início de sessão
+        _log_file.write(f"\n{'='*60}\n")
+        _log_file.write(f"SESSÃO INICIADA: {datetime.datetime.now().isoformat()}\n")
+        _log_file.write(f"{'='*60}\n\n")
+    
+    return _log_file
 
 def aprint(msg: str):
     """
-    Print assíncrono - enfileira a mensagem para ser printada por uma task separada.
+    Print assíncrono - enfileira a mensagem com timestamp para ser printada por uma task separada.
+    Também escreve em arquivo de log.
     NUNCA bloqueia a função que chamou.
     """
     global _print_queue
+    # Adiciona timestamp no momento do enfileiramento (não no momento do print)
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    timestamped_msg = f"[{ts}] {msg}"
+    
     if _print_queue is not None:
         try:
-            _print_queue.put_nowait(msg)
+            _print_queue.put_nowait(timestamped_msg)
         except asyncio.QueueFull:
             pass  # Descarta se a fila estiver cheia (evita bloqueio)
 
@@ -95,7 +138,18 @@ async def _print_worker():
     while True:
         try:
             msg = await _print_queue.get()
+            
+            # Print para terminal
             print(msg)
+            
+            # Escreve no arquivo de log (síncrono, mas é só append)
+            try:
+                log_file = _ensure_log_file()
+                if log_file:
+                    log_file.write(msg + "\n")
+            except Exception:
+                pass  # Ignora erros de I/O no log
+            
             _print_queue.task_done()
         except asyncio.CancelledError:
             # Drena a fila antes de sair
@@ -103,8 +157,20 @@ async def _print_worker():
                 try:
                     msg = _print_queue.get_nowait()
                     print(msg)
+                    try:
+                        log_file = _ensure_log_file()
+                        if log_file:
+                            log_file.write(msg + "\n")
+                    except:
+                        pass
                 except asyncio.QueueEmpty:
                     break
+            # Fecha o arquivo de log
+            if _log_file is not None:
+                try:
+                    _log_file.close()
+                except:
+                    pass
             break
         except Exception:
             pass
@@ -173,7 +239,7 @@ def get_current_token_ids():
 
 
 # ============================================================
-# ORDER STATE
+# ORDER STATE & TRACKING
 # ============================================================
 
 class OrderState(Enum):
@@ -183,6 +249,31 @@ class OrderState(Enum):
     CANCELLING = auto()     # Cancelando (aguardando confirmação)
 
 
+class OrderStatus(Enum):
+    """Status do ciclo de vida de uma ordem"""
+    CREATED = "created"         # Ordem criada
+    CANCEL_SENT = "cancel_sent" # Cancel enviado
+    CANCELLED = "cancelled"     # Confirmado cancelado
+    FILLED = "filled"           # Executado
+    UNKNOWN = "unknown"         # Estado desconhecido
+
+
+@dataclass
+class OrderHistory:
+    """Histórico completo de uma ordem"""
+    order_id: str
+    side: str  # "BID" ou "ASK"
+    price: float
+    size: float
+    created_at: float  # timestamp
+    status: OrderStatus = OrderStatus.CREATED
+    cancel_sent_at: float = None
+    cancelled_at: float = None
+    filled_at: float = None
+    fill_price: float = None
+    notes: str = ""
+
+
 @dataclass
 class OrderInfo:
     """Informações de uma ordem"""
@@ -190,7 +281,6 @@ class OrderInfo:
     price: float = None
     size: float = None
     state: OrderState = OrderState.NONE
-
 
 # ============================================================
 # MARKET MAKER V2
@@ -214,9 +304,15 @@ class MarketMakerV2:
         self.pos_yes = 0.0
         self.pos_no = 0.0
         
-        # Estado das ordens (BID = comprar YES, ASK = vender YES via comprar NO)
+        # Estado das ordens atuais (BID = comprar YES, ASK = vender YES via comprar NO)
         self.bid_order = OrderInfo()
         self.ask_order = OrderInfo()
+        
+        # Histórico completo de todas as ordens (order_id -> OrderHistory)
+        self.order_history: dict[str, OrderHistory] = {}
+        
+        # Set de order_ids que estão pendentes de confirmação de cancel
+        self.pending_cancel: set = set()
         
         # PnL tracking
         self.pnl = 0.0
@@ -227,6 +323,15 @@ class MarketMakerV2:
         
         # Lock para operações de ordem (evita race conditions)
         self.order_lock = asyncio.Lock()
+        
+        # Contadores para monitoramento
+        self.stats = {
+            "orders_created": 0,
+            "orders_cancelled": 0,
+            "orders_filled": 0,
+            "cancel_failures": 0,
+            "orphan_orders_found": 0,
+        }
     
     @property
     def position(self) -> float:
@@ -360,8 +465,11 @@ class MarketMakerV2:
     
     # ========== OPERAÇÕES DE ORDEM (SÍNCRONAS) ==========
     
-    def _place_order_sync(self, token_id: str, price: float, size: float, side: str) -> str | None:
-        """Coloca uma ordem GTC (maker) de forma síncrona"""
+    def _place_order_sync(self, token_id: str, price: float, size: float, side: str, order_side: str) -> str | None:
+        """
+        Coloca uma ordem GTC (maker) de forma síncrona.
+        order_side: "BID" ou "ASK" para tracking
+        """
         try:
             order_args = OrderArgs(
                 price=price,
@@ -374,24 +482,77 @@ class MarketMakerV2:
             resp = self.client.post_order(signed_order, orderType=OrderType.GTC)
             
             if resp and 'orderID' in resp:
-                return resp['orderID']
+                order_id = resp['orderID']
+                
+                # Registra no histórico
+                self.order_history[order_id] = OrderHistory(
+                    order_id=order_id,
+                    side=order_side,
+                    price=price,
+                    size=size,
+                    created_at=time.time(),
+                    status=OrderStatus.CREATED
+                )
+                self.stats["orders_created"] += 1
+                
+                return order_id
             return None
             
         except Exception as e:
-            # Retorna None, quem chamou pode decidir se printa ou não
+            aprint(f"⚠️ Place order exception: {e}")
             return None
     
-    def _cancel_order_sync(self, order_id: str) -> bool:
-        """Cancela uma ordem de forma síncrona"""
+    def _cancel_order_sync(self, order_id: str) -> tuple[bool, str]:
+        """
+        Cancela uma ordem de forma síncrona.
+        Retorna (sucesso, motivo)
+        """
         try:
-            self.client.cancel(order_id)
-            return True
+            # Marca no histórico
+            if order_id in self.order_history:
+                self.order_history[order_id].status = OrderStatus.CANCEL_SENT
+                self.order_history[order_id].cancel_sent_at = time.time()
+            
+            self.pending_cancel.add(order_id)
+            
+            resp = self.client.cancel(order_id=order_id)
+            
+            # Analisa resposta
+            canceled = resp.get('canceled', []) if resp else []
+            not_canceled = resp.get('not_canceled', {}) if resp else {}
+            
+            if order_id in canceled:
+                # Confirmado cancelado
+                if order_id in self.order_history:
+                    self.order_history[order_id].status = OrderStatus.CANCELLED
+                    self.order_history[order_id].cancelled_at = time.time()
+                self.pending_cancel.discard(order_id)
+                self.stats["orders_cancelled"] += 1
+                aprint(f"✅ Cancel CONFIRMADO: {order_id[:16]}...")
+                return True, "confirmed"
+            
+            elif order_id in not_canceled:
+                reason = not_canceled[order_id]
+                if order_id in self.order_history:
+                    self.order_history[order_id].notes = f"cancel failed: {reason}"
+                self.pending_cancel.discard(order_id)
+                self.stats["cancel_failures"] += 1
+                aprint(f"❌ Cancel FALHOU: {order_id[:16]}... reason={reason}")
+                return False, reason
+            
+            else:
+                # Resposta não contém o order_id - pode ter sido executado
+                self.pending_cancel.discard(order_id)
+                aprint(f"⚠️ Cancel response sem order_id: {resp}")
+                return False, "not_in_response"
+            
         except Exception as e:
-            # Retorna False, quem chamou decide se printa
-            return False
+            self.pending_cancel.discard(order_id)
+            aprint(f"⚠️ Cancel exception: {order_id[:16]}... {e}")
+            return False, str(e)
     
     def _cancel_all_orders_sync(self):
-        """Cancela todas as ordens ativas"""
+        """Cancela todas as ordens ativas conhecidas"""
         order_ids = []
         if self.bid_order.state == OrderState.ACTIVE and self.bid_order.order_id:
             order_ids.append(self.bid_order.order_id)
@@ -400,12 +561,23 @@ class MarketMakerV2:
         
         if order_ids:
             try:
-                self.client.cancel_orders(order_ids)
-                # Print DEPOIS da ação
-                aprint(f"🗑️ Canceladas {len(order_ids)} ordens")
+                resp = self.client.cancel_orders(order_ids)
+                canceled = resp.get('canceled', []) if resp else []
+                not_canceled = resp.get('not_canceled', {}) if resp else {}
+                aprint(f"🗑️ Cancel batch: canceled={len(canceled)}, failed={len(not_canceled)}")
             except Exception as e:
-                # Print DEPOIS da ação
                 aprint(f"❌ Erro ao cancelar ordens: {e}")
+    
+    def cancel_all_open_orders(self):
+        """Cancela TODAS as ordens abertas via API (não só as que conhecemos)"""
+        try:
+            # Usa cancel_all da API para garantir que não tem ordens penduradas
+            resp = self.client.cancel_all()
+            aprint(f"🧹 Cancel ALL response: {resp}")
+            return True
+        except Exception as e:
+            aprint(f"⚠️ Cancel ALL falhou: {e}")
+            return False
     
     # ========== LOOP PRINCIPAL DE FISCALIZAÇÃO ==========
     
@@ -492,12 +664,16 @@ class MarketMakerV2:
         elif self.bid_order.state == OrderState.NONE:
             # Sem ordem - verifica se deve colocar
             if should_quote_bid:
+                # Guarda pred ANTES do await (pode mudar durante a chamada)
+                pred_at_order = self.price_pred
+                
                 order_id = await asyncio.to_thread(
                     self._place_order_sync,
                     self.token_id_yes,
                     desired_bid,
                     TRADE_SIZE,
-                    BUY
+                    BUY,
+                    "BID"  # order_side para tracking
                 )
                 
                 if order_id:
@@ -507,8 +683,8 @@ class MarketMakerV2:
                         size=TRADE_SIZE,
                         state=OrderState.ACTIVE
                     )
-                    # Print DEPOIS da ação
-                    aprint(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                    # Print DEPOIS da ação (com pred do momento da decisão)
+                    aprint(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={pred_at_order:.4f} | id={order_id[:16]}...")
     
     async def _fiscalize_ask(self):
         """Fiscaliza e ajusta o ASK (vender YES via comprar NO)"""
@@ -554,12 +730,16 @@ class MarketMakerV2:
         elif self.ask_order.state == OrderState.NONE:
             # Sem ordem - verifica se deve colocar
             if should_quote_ask and no_price is not None and no_price > 0:
+                # Guarda pred ANTES do await (pode mudar durante a chamada)
+                pred_at_order = self.price_pred
+                
                 order_id = await asyncio.to_thread(
                     self._place_order_sync,
                     self.token_id_no,
                     no_price,
                     TRADE_SIZE,
-                    BUY
+                    BUY,
+                    "ASK"  # order_side para tracking
                 )
                 
                 if order_id:
@@ -569,8 +749,8 @@ class MarketMakerV2:
                         size=TRADE_SIZE,
                         state=OrderState.ACTIVE
                     )
-                    # Print DEPOIS da ação
-                    aprint(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                    # Print DEPOIS da ação (com pred do momento da decisão)
+                    aprint(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={pred_at_order:.4f} | id={order_id[:16]}...")
     
     async def _cancel_all_quotes(self):
         """Cancela todas as quotes (usado quando sai do horário de trading)"""
@@ -641,9 +821,26 @@ class MarketMakerV2:
         size = float(fill_data.get('size', 0))
         price = float(fill_data.get('price', 0))
         is_maker = fill_data.get('is_maker', False)
+        order_id = fill_data.get('order_id') or fill_data.get('orderId') or fill_data.get('id')
         
         if size <= 0:
             return
+        
+        # Atualiza histórico da ordem
+        if order_id and order_id in self.order_history:
+            hist = self.order_history[order_id]
+            hist.status = OrderStatus.FILLED
+            hist.filled_at = time.time()
+            hist.fill_price = price
+            self.stats["orders_filled"] += 1
+            aprint(f"📋 Order {order_id[:16]}... FILLED (was {hist.side} @ {hist.price:.2f})")
+        elif order_id:
+            # Ordem não está no nosso histórico
+            aprint(f"⚠️ FILL de ordem DESCONHECIDA: {side} {size} {outcome} @ {price:.4f} (order={order_id[:16]}...)")
+        
+        # Remove de pending_cancel se estava lá
+        if order_id:
+            self.pending_cancel.discard(order_id)
         
         outcome_upper = outcome.upper() if outcome else ''
         
@@ -826,6 +1023,117 @@ async def read_fills(zmq_context, maker: MarketMakerV2):
     socket.close()
 
 
+# ============================================================
+# AUDITOR DE ORDENS (VERIFICA ORDENS ÓRFÃS)
+# ============================================================
+
+async def order_auditor(maker: MarketMakerV2):
+    """
+    Audita ordens a cada 1s para detectar ordens órfãs.
+    Busca ordens ativas na API e compara com o estado local.
+    """
+    aprint("🔍 Iniciando auditor de ordens...")
+    
+    # Espera 5s para o bot estabilizar
+    await asyncio.sleep(5)
+    
+    while True:
+        try:
+            await asyncio.sleep(1)
+            
+            # Busca ordens ativas na API
+            # Usa token_id para filtrar apenas o mercado atual
+            active_orders = []
+            
+            if maker.token_id_yes:
+                try:
+                    params = OpenOrderParams(asset_id=maker.token_id_yes)
+                    orders_yes = await asyncio.to_thread(
+                        maker.client.get_orders,
+                        params
+                    )
+                    if orders_yes:
+                        active_orders.extend(orders_yes)
+                except Exception as e:
+                    aprint(f"⚠️ Auditor: erro ao buscar ordens YES: {e}")
+            
+            if maker.token_id_no:
+                try:
+                    params = OpenOrderParams(asset_id=maker.token_id_no)
+                    orders_no = await asyncio.to_thread(
+                        maker.client.get_orders,
+                        params
+                    )
+                    if orders_no:
+                        active_orders.extend(orders_no)
+                except Exception as e:
+                    aprint(f"⚠️ Auditor: erro ao buscar ordens NO: {e}")
+            
+            if not active_orders:
+                continue
+            
+            # IDs das ordens que conhecemos como ativas
+            known_active = set()
+            if maker.bid_order.state == OrderState.ACTIVE and maker.bid_order.order_id:
+                known_active.add(maker.bid_order.order_id)
+            if maker.ask_order.state == OrderState.ACTIVE and maker.ask_order.order_id:
+                known_active.add(maker.ask_order.order_id)
+            
+            # Verifica cada ordem ativa na API
+            for order in active_orders:
+                order_id = order.get('id') or order.get('order_id') or order.get('orderID')
+                if not order_id:
+                    continue
+                
+                # Se está ativa na API mas não conhecemos, é órfã!
+                if order_id not in known_active:
+                    price = order.get('price', 'N/A')
+                    size = order.get('size', 'N/A')
+                    side = order.get('side', 'N/A')
+                    
+                    aprint(f"🚨 ORDEM ÓRFÃ DETECTADA: {order_id[:16]}... side={side} price={price} size={size}")
+                    maker.stats["orphan_orders_found"] += 1
+                    
+                    # Tenta cancelar a ordem órfã
+                    try:
+                        aprint(f"🗑️ Cancelando ordem órfã {order_id[:16]}...")
+                        success, reason = await asyncio.to_thread(
+                            maker._cancel_order_sync,
+                            order_id
+                        )
+                        if success:
+                            aprint(f"✅ Ordem órfã cancelada: {order_id[:16]}...")
+                        else:
+                            aprint(f"❌ Falha ao cancelar órfã: {order_id[:16]}... reason={reason}")
+                    except Exception as e:
+                        aprint(f"❌ Exception ao cancelar órfã: {e}")
+        
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            aprint(f"❌ Erro no auditor: {e}")
+            await asyncio.sleep(1)
+
+
+async def queue_monitor():
+    """
+    Monitora o tamanho da fila de prints.
+    Alerta se a fila estiver ficando grande (indica que o sistema está lento).
+    """
+    global _print_queue
+    
+    while True:
+        await asyncio.sleep(2)
+        
+        if _print_queue is not None:
+            qsize = _print_queue.qsize()
+            if qsize > 50:
+                # Usa print direto para garantir que aparece
+                print(f"⚠️ [QUEUE WARNING] Print queue size: {qsize} (>50 = lento!)")
+            elif qsize > 100:
+                print(f"🚨 [QUEUE CRITICAL] Print queue size: {qsize} (>100 = muito lento!)")
+
+
 async def status_printer(maker: MarketMakerV2):
     """Imprime status periodicamente"""
     while True:
@@ -854,6 +1162,15 @@ async def status_printer(maker: MarketMakerV2):
             
             mkt_mid = (maker.best_bid + maker.best_ask) / 2 if maker.best_bid and maker.best_ask else None
             mkt_pnl = maker.pnl + (maker.pos_yes * mkt_mid + maker.pos_no * (1 - mkt_mid)) if mkt_mid is not None else 0
+            
+            # Tamanho da fila de prints
+            queue_size = _print_queue.qsize() if _print_queue else 0
+            queue_str = f"q={queue_size}" if queue_size < 20 else f"⚠️q={queue_size}"
+            
+            # Stats resumidas
+            stats_str = f"ord:{maker.stats['orders_created']}/can:{maker.stats['orders_cancelled']}/fill:{maker.stats['orders_filled']}"
+            if maker.stats['orphan_orders_found'] > 0:
+                stats_str += f"/🚨orph:{maker.stats['orphan_orders_found']}"
 
             aprint(
                 f"📊 pred={maker.price_pred:.4f} | "
@@ -862,7 +1179,8 @@ async def status_printer(maker: MarketMakerV2):
                 f"desired: {desired_bid_str}/{desired_ask_str} | "
                 f"pos: {maker.pos_yes:.1f}Y/{maker.pos_no:.1f}N ({pos:+.1f}) | "
                 f"pnl={mkt_pnl:.2f} | "
-                f"t={t:.1f}min {can_trade}"
+                f"t={t:.1f}min {can_trade} | "
+                f"{stats_str} | {queue_str}"
             )
 
 
@@ -896,6 +1214,13 @@ async def main():
     
     maker = MarketMakerV2(client)
     
+    print("\n🧹 Cancelando TODAS as ordens abertas (limpeza inicial)...")
+    try:
+        maker.cancel_all_open_orders()
+        print("✅ Limpeza inicial concluída!")
+    except Exception as e:
+        print(f"⚠️ Erro na limpeza inicial: {e}")
+    
     print("\n🔄 Buscando token IDs do mercado atual...")
     if not maker.update_token_ids():
         print("⚠️ Falha ao buscar token IDs iniciais (pode funcionar depois)")
@@ -911,11 +1236,13 @@ async def main():
     
     tasks = [
         asyncio.create_task(_print_worker()),  # Print assíncrono (deve ser o primeiro!)
+        asyncio.create_task(queue_monitor()),  # Monitora tamanho das filas
         asyncio.create_task(read_price_pred(zmq_context, maker)),
         asyncio.create_task(read_bid_ask(zmq_context, maker)),
         asyncio.create_task(read_price_15(zmq_context, maker)),
         asyncio.create_task(read_fills(zmq_context, maker)),
         asyncio.create_task(maker.fiscalize_loop()),  # Loop de fiscalização
+        asyncio.create_task(order_auditor(maker)),  # Auditor de ordens órfãs
         asyncio.create_task(status_printer(maker)),
     ]
     
@@ -926,6 +1253,10 @@ async def main():
     finally:
         aprint("🗑️ Cancelando ordens pendentes...")
         maker._cancel_all_orders_sync()
+        
+        # Log final de estatísticas
+        aprint(f"📈 STATS FINAIS: {maker.stats}")
+        aprint(f"📋 Ordens no histórico: {len(maker.order_history)}")
         
         for task in tasks:
             task.cancel()
