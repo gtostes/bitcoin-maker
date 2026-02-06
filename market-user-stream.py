@@ -334,48 +334,49 @@ class UserWebSocket:
         # Verificar maker_orders para encontrar minhas ordens
         maker_orders = data.get('maker_orders', [])
         
-        my_matched_amount = 0.0
-        my_price = None
-        my_outcome = None
-        my_side = None
-
-        
+        # Processa cada maker_order separadamente (para ter order_id correto)
         for maker_order in maker_orders:
             owner = maker_order.get('owner', '')
             
             # Verificar se esta ordem maker é minha
             if owner == self.my_api_key:
                 matched = float(maker_order.get('matched_amount', 0))
-                my_matched_amount += matched
+                if matched <= 0:
+                    continue
+                    
                 my_price = float(maker_order.get('price', 0))
                 my_outcome = maker_order.get('outcome')
+                my_order_id = maker_order.get('order_id')  # ORDER ID da minha ordem!
+                
                 # Maker side: se eu sou maker e alguém comprou, eu estava vendendo e vice-versa
                 # O trade.side é do taker, então meu side é o oposto
                 taker_side = data.get('side', '')
                 taker_outcome = data.get('outcome', '')
 
-                if( taker_outcome != my_outcome): my_side = taker_side
-                else: my_side = 'SELL' if taker_side == 'BUY' else 'BUY'
-        
-        # Se tive match em alguma ordem minha
-        if my_matched_amount > 0:
-            fill_data = {
-                'event_type': 'fill',
-                'status': status,
-                'side': my_side,              # Meu lado (oposto do taker)
-                'outcome': my_outcome,         # YES ou NO
-                'size': my_matched_amount,     # Quantidade que foi matched da MINHA ordem
-                'price': my_price,
-                'asset_id': data.get('asset_id'),
-                'timestamp': data.get('timestamp'),
-                'is_maker': True,              # Indica que fui maker
-            }
-            
-            # Enviar via IPC
-            self.zmq_socket.send_json(fill_data)
-            
-            if self.verbose:
-                print(f"💰 MAKER FILL: {my_side} {my_matched_amount} {my_outcome} @ {my_price} [{status}]")
+                if taker_outcome != my_outcome:
+                    my_side = taker_side
+                else:
+                    my_side = 'SELL' if taker_side == 'BUY' else 'BUY'
+                
+                fill_data = {
+                    'event_type': 'fill',
+                    'status': status,
+                    'side': my_side,              # Meu lado (oposto do taker)
+                    'outcome': my_outcome,         # YES ou NO
+                    'size': matched,               # Quantidade que foi matched DESTA ordem
+                    'price': my_price,
+                    'asset_id': data.get('asset_id'),
+                    'timestamp': data.get('timestamp'),
+                    'is_maker': True,              # Indica que fui maker
+                    'order_id': my_order_id,       # ID da minha ordem maker!
+                }
+                
+                # Enviar via IPC
+                self.zmq_socket.send_json(fill_data)
+                
+                if self.verbose:
+                    order_id_short = my_order_id[:16] if my_order_id else "N/A"
+                    print(f"💰 MAKER FILL: {my_side} {matched} {my_outcome} @ {my_price} [{status}] order={order_id_short}...")
         
         # Também verificar se EU sou o taker (trade_owner == my_api_key)
         trade_owner = data.get('trade_owner', '')
@@ -390,12 +391,14 @@ class UserWebSocket:
                 'asset_id': data.get('asset_id'),
                 'timestamp': data.get('timestamp'),
                 'is_maker': False,                  # Indica que fui taker
+                'order_id': data.get('taker_order_id'),  # ID da minha ordem taker
             }
             
             self.zmq_socket.send_json(taker_fill)
             
             if self.verbose:
-                print(f"💰 TAKER FILL: {taker_fill['side']} {taker_fill['size']} {taker_fill['outcome']} @ {taker_fill['price']} [{status}]")
+                order_id_short = taker_fill['order_id'][:16] if taker_fill['order_id'] else "N/A"
+                print(f"💰 TAKER FILL: {taker_fill['side']} {taker_fill['size']} {taker_fill['outcome']} @ {taker_fill['price']} [{status}] order={order_id_short}")
     
     def process_order(self, data):
         """Processa atualizações de ordem (opcional, para debug)"""

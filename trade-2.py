@@ -279,8 +279,21 @@ class OrderInfo:
     """Informações de uma ordem"""
     order_id: str = None
     price: float = None
-    size: float = None
+    size: float = None              # Tamanho original da ordem
+    filled_size: float = 0.0        # Quanto já foi executado (para partial fills)
     state: OrderState = OrderState.NONE
+    
+    @property
+    def remaining_size(self) -> float:
+        """Tamanho restante da ordem"""
+        return self.size - self.filled_size if self.size else 0.0
+    
+    @property
+    def is_fully_filled(self) -> bool:
+        """Verifica se a ordem foi completamente executada"""
+        if self.size is None:
+            return False
+        return self.filled_size >= self.size - 0.001  # Tolerância para float
 
 # ============================================================
 # MARKET MAKER V2
@@ -639,13 +652,20 @@ class MarketMakerV2:
         
         if self.bid_order.state == OrderState.ACTIVE:
             # Tem ordem ativa - verifica se precisa cancelar
-            if not should_quote_bid or self.should_cancel_bid(self.bid_order.price):
+            needs_cancel = not should_quote_bid or self.should_cancel_bid(self.bid_order.price)
+            
+            # Log se tem partial fill
+            if self.bid_order.filled_size > 0:
+                aprint(f"📊 BID tem partial fill: {self.bid_order.filled_size:.1f}/{self.bid_order.size:.1f}")
+            
+            if needs_cancel:
                 # Precisa cancelar - guarda info para print DEPOIS
                 old_price = self.bid_order.price
                 old_pred = self.price_pred
+                old_filled = self.bid_order.filled_size
                 
                 self.bid_order.state = OrderState.CANCELLING
-                success = await asyncio.to_thread(
+                success, reason = await asyncio.to_thread(
                     self._cancel_order_sync, 
                     self.bid_order.order_id
                 )
@@ -653,9 +673,9 @@ class MarketMakerV2:
                 
                 # Print DEPOIS da ação
                 if success:
-                    aprint(f"✅ BID cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
+                    aprint(f"✅ BID cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f}, filled={old_filled:.1f})")
                 else:
-                    aprint(f"⚠️ BID: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
+                    aprint(f"⚠️ BID cancel failed @ {old_price:.2f} reason={reason} (filled={old_filled:.1f})")
         
         elif self.bid_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -681,6 +701,7 @@ class MarketMakerV2:
                         order_id=order_id,
                         price=desired_bid,
                         size=TRADE_SIZE,
+                        filled_size=0.0,
                         state=OrderState.ACTIVE
                     )
                     # Print DEPOIS da ação (com pred do momento da decisão)
@@ -705,13 +726,20 @@ class MarketMakerV2:
         if self.ask_order.state == OrderState.ACTIVE:
             # Tem ordem ativa - verifica se precisa cancelar
             # ask_order.price guarda o preço do ASK (YES), não do NO
-            if not should_quote_ask or self.should_cancel_ask(self.ask_order.price):
+            needs_cancel = not should_quote_ask or self.should_cancel_ask(self.ask_order.price)
+            
+            # Log se tem partial fill
+            if self.ask_order.filled_size > 0:
+                aprint(f"📊 ASK tem partial fill: {self.ask_order.filled_size:.1f}/{self.ask_order.size:.1f}")
+            
+            if needs_cancel:
                 # Precisa cancelar - guarda info para print DEPOIS
                 old_price = self.ask_order.price
                 old_pred = self.price_pred
+                old_filled = self.ask_order.filled_size
                 
                 self.ask_order.state = OrderState.CANCELLING
-                success = await asyncio.to_thread(
+                success, reason = await asyncio.to_thread(
                     self._cancel_order_sync, 
                     self.ask_order.order_id
                 )
@@ -719,9 +747,9 @@ class MarketMakerV2:
                 
                 # Print DEPOIS da ação
                 if success:
-                    aprint(f"✅ ASK cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
+                    aprint(f"✅ ASK cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f}, filled={old_filled:.1f})")
                 else:
-                    aprint(f"⚠️ ASK: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
+                    aprint(f"⚠️ ASK cancel failed @ {old_price:.2f} reason={reason} (filled={old_filled:.1f})")
         
         elif self.ask_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -747,6 +775,7 @@ class MarketMakerV2:
                         order_id=order_id,
                         price=desired_ask,  # Guarda o preço do ASK (YES)
                         size=TRADE_SIZE,
+                        filled_size=0.0,
                         state=OrderState.ACTIVE
                     )
                     # Print DEPOIS da ação (com pred do momento da decisão)
@@ -815,58 +844,117 @@ class MarketMakerV2:
             self.update_token_ids()
     
     async def on_fill(self, fill_data: dict):
-        """Processa fill recebido do User Channel (com lock para evitar race condition)"""
+        """
+        Processa fill recebido do User Channel.
+        
+        LÓGICA DE PARTIAL FILLS:
+        - Se a ordem foi parcialmente executada, apenas atualiza filled_size
+        - A ordem permanece ACTIVE até ser totalmente executada
+        - Só marca como NONE quando is_fully_filled ou quando não conseguimos identificar
+        """
         side = fill_data.get('side')
         outcome = fill_data.get('outcome')
         size = float(fill_data.get('size', 0))
         price = float(fill_data.get('price', 0))
         is_maker = fill_data.get('is_maker', False)
-        order_id = fill_data.get('order_id') or fill_data.get('orderId') or fill_data.get('id')
+        order_id = fill_data.get('order_id')
         
         if size <= 0:
             return
         
+        outcome_upper = outcome.upper() if outcome else ''
+        
+        # Identifica qual ordem foi executada
+        is_bid_fill = False
+        is_ask_fill = False
+        
+        # BUY UP = comprou YES = BID order
+        # BUY DOWN = comprou NO = ASK order (vendemos YES comprando NO)
+        if side == 'BUY':
+            if outcome_upper == 'UP':
+                is_bid_fill = True
+            elif outcome_upper == 'DOWN':
+                is_ask_fill = True
+        
+        # Verifica se o order_id bate com nossa ordem atual
+        order_matches_bid = order_id and self.bid_order.order_id == order_id
+        order_matches_ask = order_id and self.ask_order.order_id == order_id
+        
+        # Log detalhado
+        order_id_short = order_id[:16] if order_id else "N/A"
+        aprint(f"📥 FILL recebido: {side} {size} {outcome} @ {price:.4f} order={order_id_short}...")
+        
         # Atualiza histórico da ordem
         if order_id and order_id in self.order_history:
             hist = self.order_history[order_id]
-            hist.status = OrderStatus.FILLED
+            # Não marca como FILLED ainda se for partial
             hist.filled_at = time.time()
             hist.fill_price = price
-            self.stats["orders_filled"] += 1
-            aprint(f"📋 Order {order_id[:16]}... FILLED (was {hist.side} @ {hist.price:.2f})")
         elif order_id:
-            # Ordem não está no nosso histórico
-            aprint(f"⚠️ FILL de ordem DESCONHECIDA: {side} {size} {outcome} @ {price:.4f} (order={order_id[:16]}...)")
+            aprint(f"⚠️ FILL de ordem DESCONHECIDA: order={order_id_short}...")
         
         # Remove de pending_cancel se estava lá
         if order_id:
             self.pending_cancel.discard(order_id)
         
-        outcome_upper = outcome.upper() if outcome else ''
-        
-        # IMPORTANTE: Marca ordem como NONE imediatamente, ANTES de pegar o lock
-        # Isso evita que fiscalize_loop tente cancelar uma ordem já executada
-        # enquanto esperamos o lock
-        if side == 'BUY':
-            if outcome_upper == 'UP' and self.bid_order.state == OrderState.ACTIVE:
-                self.bid_order.state = OrderState.NONE  # Marca imediatamente
-            elif outcome_upper == 'DOWN' and self.ask_order.state == OrderState.ACTIVE:
-                self.ask_order.state = OrderState.NONE  # Marca imediatamente
-        
-        # Agora pega o lock para atualizar posição de forma segura
         async with self.order_lock:
-            # Atualiza posição
-            if side == 'BUY':
-                if outcome_upper == 'UP':
-                    self.pos_yes += size
-                    self.pnl -= size * price
-                    # Limpa completamente o estado da ordem
-                    self.bid_order = OrderInfo()
-                elif outcome_upper == 'DOWN':
-                    self.pos_no += size
-                    self.pnl -= size * price
-                    # Limpa completamente o estado da ordem
-                    self.ask_order = OrderInfo()
+            # ========== PROCESSA BID FILL ==========
+            if is_bid_fill:
+                if order_matches_bid or (not order_id and self.bid_order.state == OrderState.ACTIVE):
+                    # É a nossa ordem de BID
+                    old_filled = self.bid_order.filled_size
+                    self.bid_order.filled_size += size
+                    
+                    aprint(f"📊 BID fill: {old_filled:.1f} -> {self.bid_order.filled_size:.1f} / {self.bid_order.size:.1f}")
+                    
+                    if self.bid_order.is_fully_filled:
+                        # Ordem completamente executada
+                        aprint(f"✅ BID FULLY FILLED @ {self.bid_order.price:.2f}")
+                        if order_id and order_id in self.order_history:
+                            self.order_history[order_id].status = OrderStatus.FILLED
+                        self.stats["orders_filled"] += 1
+                        self.bid_order = OrderInfo()  # Limpa a ordem
+                    else:
+                        # Partial fill - ordem continua ativa
+                        aprint(f"⏳ BID PARTIAL FILL: remaining={self.bid_order.remaining_size:.1f}")
+                        # NÃO limpa a ordem, ela continua ACTIVE
+                else:
+                    # Fill de ordem que não é a atual (órfã ou antiga)
+                    aprint(f"⚠️ BID fill de ordem diferente da atual (atual={self.bid_order.order_id[:16] if self.bid_order.order_id else 'None'}...)")
+                
+                # Atualiza posição independente
+                self.pos_yes += size
+                self.pnl -= size * price
+            
+            # ========== PROCESSA ASK FILL ==========
+            elif is_ask_fill:
+                if order_matches_ask or (not order_id and self.ask_order.state == OrderState.ACTIVE):
+                    # É a nossa ordem de ASK
+                    old_filled = self.ask_order.filled_size
+                    self.ask_order.filled_size += size
+                    
+                    aprint(f"📊 ASK fill: {old_filled:.1f} -> {self.ask_order.filled_size:.1f} / {self.ask_order.size:.1f}")
+                    
+                    if self.ask_order.is_fully_filled:
+                        # Ordem completamente executada
+                        aprint(f"✅ ASK FULLY FILLED @ {self.ask_order.price:.2f}")
+                        if order_id and order_id in self.order_history:
+                            self.order_history[order_id].status = OrderStatus.FILLED
+                        self.stats["orders_filled"] += 1
+                        self.ask_order = OrderInfo()  # Limpa a ordem
+                    else:
+                        # Partial fill - ordem continua ativa
+                        aprint(f"⏳ ASK PARTIAL FILL: remaining={self.ask_order.remaining_size:.1f}")
+                        # NÃO limpa a ordem, ela continua ACTIVE
+                else:
+                    # Fill de ordem que não é a atual (órfã ou antiga)
+                    aprint(f"⚠️ ASK fill de ordem diferente da atual (atual={self.ask_order.order_id[:16] if self.ask_order.order_id else 'None'}...)")
+                
+                # Atualiza posição independente
+                self.pos_no += size
+                self.pnl -= size * price
+            
+            # ========== SELL (raro, mas tratamos) ==========
             elif side == 'SELL':
                 if outcome_upper == 'UP':
                     self.pos_yes -= size
@@ -1146,9 +1234,22 @@ async def status_printer(maker: MarketMakerV2):
             
             can_trade = "✅" if maker._can_trade() else "❌"
             
-            # Status das ordens
-            bid_status = f"BID@{maker.bid_order.price:.2f}" if maker.bid_order.state == OrderState.ACTIVE else "---"
-            ask_status = f"ASK@{maker.ask_order.price:.2f}" if maker.ask_order.state == OrderState.ACTIVE else "---"
+            # Status das ordens (com info de partial fill)
+            if maker.bid_order.state == OrderState.ACTIVE:
+                if maker.bid_order.filled_size > 0:
+                    bid_status = f"BID@{maker.bid_order.price:.2f}({maker.bid_order.filled_size:.0f}/{maker.bid_order.size:.0f})"
+                else:
+                    bid_status = f"BID@{maker.bid_order.price:.2f}"
+            else:
+                bid_status = "---"
+            
+            if maker.ask_order.state == OrderState.ACTIVE:
+                if maker.ask_order.filled_size > 0:
+                    ask_status = f"ASK@{maker.ask_order.price:.2f}({maker.ask_order.filled_size:.0f}/{maker.ask_order.size:.0f})"
+                else:
+                    ask_status = f"ASK@{maker.ask_order.price:.2f}"
+            else:
+                ask_status = "---"
             
             # Preços desejados
             desired_bid = maker.calculate_bid_price()
