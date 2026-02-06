@@ -57,7 +57,7 @@ MAX_POSITION = 25         # Posição máxima (YES - NO)
 SPREAD_QUOTE = 0.04       # Spread para colocar quote (4 cents cada lado)
 SPREAD_CANCEL = 0.025      # Spread para cancelar quote (2.5 cents cada lado)
 SKEW_FACTOR = 0.002       # Fator de skew por unidade de posição
-MAX_DISTANCE = 0.12       # Distância máxima do mercado para cancelar (12 cents)
+MAX_DISTANCE = 0.10       # Distância máxima do mercado para cancelar (12 cents)
 
 # Intervalos de tempo
 FISCALIZE_INTERVAL = 0.2  # Fiscaliza quotes a cada 200ms
