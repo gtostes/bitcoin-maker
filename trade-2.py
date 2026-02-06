@@ -4,14 +4,14 @@ POLYMARKET MARKET MAKER V2
 
 Estratégia:
 - Fiscaliza quotes a cada 0.2s (não reage a eventos)
-- Compra pelo maior preço <= min(price_pred - 0.05 - 0.002*pos, best_bid)
-- Vende pelo menor preço >= max(price_pred + 0.05 - 0.002*pos, best_ask)
+- Compra pelo maior preço <= min(price_pred - SPREAD_QUOTE - SKEW*pos, best_bid)
+- Vende pelo menor preço >= max(price_pred + SPREAD_QUOTE - SKEW*pos, best_ask)
 - Cancela BID se:
-  - price > price_pred - 0.04 - 0.002*pos (muito caro)
-  - price < best_bid - 0.10 (muito longe do mercado)
+  - |my_bid - desired_bid| > SPREAD_CANCEL (longe da quote ideal)
+  - my_bid < best_bid - MAX_DISTANCE (muito longe do mercado)
 - Cancela ASK se:
-  - price < price_pred + 0.04 - 0.002*pos (muito barato)
-  - price > best_ask + 0.10 (muito longe do mercado)
+  - |my_ask - desired_ask| > SPREAD_CANCEL (longe da quote ideal)
+  - my_ask > best_ask + MAX_DISTANCE (muito longe do mercado)
 - Posição máxima: ±25, trade size: 5
 - Não opera nos primeiros 30s e últimos 30s do período
 """
@@ -55,9 +55,9 @@ IPC_FILLS = "ipc:///tmp/polymarket_fills.ipc"     # Recebe fills do User Channel
 TRADE_SIZE = 5            # Tamanho de cada quote
 MAX_POSITION = 25         # Posição máxima (YES - NO)
 SPREAD_QUOTE = 0.04       # Spread para colocar quote (4 cents cada lado)
-SPREAD_CANCEL = 0.025      # Spread para cancelar quote (2.5 cents cada lado)
+SPREAD_CANCEL = 0.015     # Distância máxima da quote ideal para cancelar
 SKEW_FACTOR = 0.002       # Fator de skew por unidade de posição
-MAX_DISTANCE = 0.10       # Distância máxima do mercado para cancelar (12 cents)
+MAX_DISTANCE = 0.10       # Distância máxima do mercado para cancelar (10 cents)
 
 # Intervalos de tempo
 FISCALIZE_INTERVAL = 0.2  # Fiscaliza quotes a cada 200ms
@@ -145,9 +145,11 @@ class OrderState(Enum):
 class OrderInfo:
     """Informações de uma ordem"""
     order_id: str = None
-    price: float = None
+    price: float = None       # Preço em termos de YES (bid/ask do YES)
     size: float = None
     state: OrderState = OrderState.NONE
+    token: str = None         # 'YES' ou 'NO' - qual token foi usado
+    side: str = None          # 'BUY' ou 'SELL'
 
 
 # ============================================================
@@ -280,17 +282,16 @@ class MarketMakerV2:
         """
         Verifica se deve cancelar BID.
         Cancela se:
-        1. price > price_pred - 0.04 - 0.002*pos (muito caro)
-        2. price < best_bid - 0.10 (muito longe do mercado)
+        1. |current_price - desired_bid| > SPREAD_CANCEL (longe da quote ideal)
+        2. current_price < best_bid - MAX_DISTANCE (muito longe do mercado)
         """
-        if self.price_pred is None:
-            return True  # Sem preço de referência, cancela
-        
-        pos = self.position
-        
-        # Condição 1: preço muito alto (próximo demais do fair value)
-        threshold_high = self.price_pred - SPREAD_CANCEL - SKEW_FACTOR * pos
-        if current_price > threshold_high:
+        # Condição 1: longe da quote ideal
+        desired_bid = self.calculate_bid_price()
+        if desired_bid is not None:
+            if abs(current_price - desired_bid) > SPREAD_CANCEL:
+                return True
+        else:
+            # Sem preço desejado válido, cancela
             return True
         
         # Condição 2: preço muito longe do mercado
@@ -303,17 +304,16 @@ class MarketMakerV2:
         """
         Verifica se deve cancelar ASK.
         Cancela se:
-        1. price < price_pred + 0.04 - 0.002*pos (muito barato)
-        2. price > best_ask + 0.10 (muito longe do mercado)
+        1. |current_price - desired_ask| > SPREAD_CANCEL (longe da quote ideal)
+        2. current_price > best_ask + MAX_DISTANCE (muito longe do mercado)
         """
-        if self.price_pred is None:
-            return True  # Sem preço de referência, cancela
-        
-        pos = self.position
-        
-        # Condição 1: preço muito baixo (próximo demais do fair value)
-        threshold_low = self.price_pred + SPREAD_CANCEL - SKEW_FACTOR * pos
-        if current_price < threshold_low:
+        # Condição 1: longe da quote ideal
+        desired_ask = self.calculate_ask_price()
+        if desired_ask is not None:
+            if abs(current_price - desired_ask) > SPREAD_CANCEL:
+                return True
+        else:
+            # Sem preço desejado válido, cancela
             return True
         
         # Condição 2: preço muito longe do mercado
@@ -416,7 +416,12 @@ class MarketMakerV2:
             await self._fiscalize_ask()
     
     async def _fiscalize_bid(self):
-        """Fiscaliza e ajusta o BID (comprar YES)"""
+        """
+        Fiscaliza e ajusta o BID (comprar YES ou vender NO).
+        
+        NETTING: Se tenho posição em NO, vendo NO em vez de comprar YES.
+        - Comprar YES @ price = Vender NO @ (1-price)
+        """
         pos = self.position
         desired_bid = self.calculate_bid_price()
         
@@ -455,25 +460,57 @@ class MarketMakerV2:
         elif self.bid_order.state == OrderState.NONE:
             # Sem ordem - verifica se deve colocar
             if should_quote_bid:
-                order_id = await asyncio.to_thread(
-                    self._place_order_sync,
-                    self.token_id_yes,
-                    desired_bid,
-                    TRADE_SIZE,
-                    BUY
-                )
-                
-                if order_id:
-                    self.bid_order = OrderInfo(
-                        order_id=order_id,
-                        price=desired_bid,
-                        size=TRADE_SIZE,
-                        state=OrderState.ACTIVE
+                # NETTING: Se tenho NO, vendo NO em vez de comprar YES
+                if self.pos_no >= TRADE_SIZE:
+                    # Vender NO @ (1 - desired_bid)
+                    sell_no_price = round_price_up(1 - desired_bid)
+                    if sell_no_price > 0 and sell_no_price < 1:
+                        order_id = await asyncio.to_thread(
+                            self._place_order_sync,
+                            self.token_id_no,
+                            sell_no_price,
+                            TRADE_SIZE,
+                            SELL
+                        )
+                        
+                        if order_id:
+                            self.bid_order = OrderInfo(
+                                order_id=order_id,
+                                price=desired_bid,
+                                size=TRADE_SIZE,
+                                state=OrderState.ACTIVE,
+                                token='NO',
+                                side='SELL'
+                            )
+                            print(f"📝 BID via SELL NO @ {sell_no_price:.2f} (bid={desired_bid:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                else:
+                    # Comprar YES normalmente
+                    order_id = await asyncio.to_thread(
+                        self._place_order_sync,
+                        self.token_id_yes,
+                        desired_bid,
+                        TRADE_SIZE,
+                        BUY
                     )
-                    print(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                    
+                    if order_id:
+                        self.bid_order = OrderInfo(
+                            order_id=order_id,
+                            price=desired_bid,
+                            size=TRADE_SIZE,
+                            state=OrderState.ACTIVE,
+                            token='YES',
+                            side='BUY'
+                        )
+                        print(f"📝 BID BUY YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _fiscalize_ask(self):
-        """Fiscaliza e ajusta o ASK (vender YES via comprar NO)"""
+        """
+        Fiscaliza e ajusta o ASK (vender YES ou comprar NO).
+        
+        NETTING: Se tenho posição em YES, vendo YES em vez de comprar NO.
+        - Vender YES @ price = Comprar NO @ (1-price)
+        """
         pos = self.position
         desired_ask = self.calculate_ask_price()
         
@@ -485,12 +522,9 @@ class MarketMakerV2:
             if desired_ask > self.best_ask + MAX_DISTANCE:
                 should_quote_ask = False
         
-        # Preço do NO = 1 - ask_price
-        no_price = round_price_down(1 - desired_ask) if desired_ask else None
-        
         if self.ask_order.state == OrderState.ACTIVE:
             # Tem ordem ativa - verifica se precisa cancelar
-            # ask_order.price guarda o preço do ASK (YES), não do NO
+            # ask_order.price guarda o preço do ASK (YES)
             if not should_quote_ask or self.should_cancel_ask(self.ask_order.price):
                 # Precisa cancelar
                 self.ask_order.state = OrderState.CANCELLING
@@ -515,23 +549,51 @@ class MarketMakerV2:
         
         elif self.ask_order.state == OrderState.NONE:
             # Sem ordem - verifica se deve colocar
-            if should_quote_ask and no_price is not None and no_price > 0:
-                order_id = await asyncio.to_thread(
-                    self._place_order_sync,
-                    self.token_id_no,
-                    no_price,
-                    TRADE_SIZE,
-                    BUY
-                )
-                
-                if order_id:
-                    self.ask_order = OrderInfo(
-                        order_id=order_id,
-                        price=desired_ask,  # Guarda o preço do ASK (YES)
-                        size=TRADE_SIZE,
-                        state=OrderState.ACTIVE
-                    )
-                    print(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
+            if should_quote_ask:
+                # NETTING: Se tenho YES, vendo YES em vez de comprar NO
+                if self.pos_yes >= TRADE_SIZE:
+                    # Vender YES @ desired_ask
+                    if desired_ask > 0 and desired_ask < 1:
+                        order_id = await asyncio.to_thread(
+                            self._place_order_sync,
+                            self.token_id_yes,
+                            desired_ask,
+                            TRADE_SIZE,
+                            SELL
+                        )
+                        
+                        if order_id:
+                            self.ask_order = OrderInfo(
+                                order_id=order_id,
+                                price=desired_ask,
+                                size=TRADE_SIZE,
+                                state=OrderState.ACTIVE,
+                                token='YES',
+                                side='SELL'
+                            )
+                            print(f"📝 ASK SELL YES @ {desired_ask:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                else:
+                    # Comprar NO @ (1 - desired_ask)
+                    no_price = round_price_down(1 - desired_ask)
+                    if no_price > 0 and no_price < 1:
+                        order_id = await asyncio.to_thread(
+                            self._place_order_sync,
+                            self.token_id_no,
+                            no_price,
+                            TRADE_SIZE,
+                            BUY
+                        )
+                        
+                        if order_id:
+                            self.ask_order = OrderInfo(
+                                order_id=order_id,
+                                price=desired_ask,  # Guarda o preço do ASK (YES)
+                                size=TRADE_SIZE,
+                                state=OrderState.ACTIVE,
+                                token='NO',
+                                side='BUY'
+                            )
+                            print(f"📝 ASK via BUY NO @ {no_price:.2f} (ask={desired_ask:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _cancel_all_quotes(self):
         """Cancela todas as quotes (usado quando sai do horário de trading)"""
@@ -608,23 +670,34 @@ class MarketMakerV2:
         
         # Adquire lock para evitar race condition com fiscalize_quotes
         async with self.order_lock:
-            # Atualiza posição
+            # Atualiza posição baseado no fill
             if side == 'BUY':
                 if outcome_upper == 'UP':
                     self.pos_yes += size
-                    # Se era nosso BID, limpa o estado
-                    if self.bid_order.state == OrderState.ACTIVE:
-                        self.bid_order = OrderInfo()
                 elif outcome_upper == 'DOWN':
                     self.pos_no += size
-                    # Se era nosso ASK (compra NO), limpa o estado
-                    if self.ask_order.state == OrderState.ACTIVE:
-                        self.ask_order = OrderInfo()
             elif side == 'SELL':
                 if outcome_upper == 'UP':
                     self.pos_yes -= size
                 elif outcome_upper == 'DOWN':
                     self.pos_no -= size
+            
+            # Limpa estado das ordens baseado no fill
+            # BID pode ser: BUY YES ou SELL NO
+            if self.bid_order.state == OrderState.ACTIVE:
+                if ((self.bid_order.token == 'YES' and self.bid_order.side == 'BUY' and 
+                     side == 'BUY' and outcome_upper == 'UP') or
+                    (self.bid_order.token == 'NO' and self.bid_order.side == 'SELL' and 
+                     side == 'SELL' and outcome_upper == 'DOWN')):
+                    self.bid_order = OrderInfo()
+            
+            # ASK pode ser: SELL YES ou BUY NO
+            if self.ask_order.state == OrderState.ACTIVE:
+                if ((self.ask_order.token == 'YES' and self.ask_order.side == 'SELL' and 
+                     side == 'SELL' and outcome_upper == 'UP') or
+                    (self.ask_order.token == 'NO' and self.ask_order.side == 'BUY' and 
+                     side == 'BUY' and outcome_upper == 'DOWN')):
+                    self.ask_order = OrderInfo()
             
             self.total_traded += size
         
@@ -784,9 +857,18 @@ async def status_printer(maker: MarketMakerV2):
             
             can_trade = "✅" if maker._can_trade() else "❌"
             
-            # Status das ordens
-            bid_status = f"BID@{maker.bid_order.price:.2f}" if maker.bid_order.state == OrderState.ACTIVE else "---"
-            ask_status = f"ASK@{maker.ask_order.price:.2f}" if maker.ask_order.state == OrderState.ACTIVE else "---"
+            # Status das ordens (inclui tipo: BUY/SELL token)
+            if maker.bid_order.state == OrderState.ACTIVE:
+                bid_type = f"{maker.bid_order.side[0]}{maker.bid_order.token[0]}" if maker.bid_order.side else "?"
+                bid_status = f"BID@{maker.bid_order.price:.2f}({bid_type})"
+            else:
+                bid_status = "---"
+            
+            if maker.ask_order.state == OrderState.ACTIVE:
+                ask_type = f"{maker.ask_order.side[0]}{maker.ask_order.token[0]}" if maker.ask_order.side else "?"
+                ask_status = f"ASK@{maker.ask_order.price:.2f}({ask_type})"
+            else:
+                ask_status = "---"
             
             # Preços desejados
             desired_bid = maker.calculate_bid_price()
@@ -821,9 +903,8 @@ async def main():
     print(f"📋 Estratégia:")
     print(f"   - BID  = min(floor(price_pred - {SPREAD_QUOTE} - {SKEW_FACTOR}*pos), best_bid)")
     print(f"   - ASK  = max(ceil(price_pred + {SPREAD_QUOTE} - {SKEW_FACTOR}*pos), best_ask)")
-    print(f"   - Cancel BID se price > price_pred - {SPREAD_CANCEL} - {SKEW_FACTOR}*pos")
+    print(f"   - Cancel BID/ASK se |price - desired| > {SPREAD_CANCEL}")
     print(f"   - Cancel BID se price < best_bid - {MAX_DISTANCE}")
-    print(f"   - Cancel ASK se price < price_pred + {SPREAD_CANCEL} - {SKEW_FACTOR}*pos")
     print(f"   - Cancel ASK se price > best_ask + {MAX_DISTANCE}")
     print(f"   - Fiscaliza a cada: {FISCALIZE_INTERVAL}s")
     print(f"   - Trade size: {TRADE_SIZE}, Max position: ±{MAX_POSITION}")
