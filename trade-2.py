@@ -337,7 +337,7 @@ class MarketMakerV2:
             return None
             
         except Exception as e:
-            print(f"❌ Erro ao colocar ordem: {e}")
+            # Retorna None, quem chamou pode decidir se printa ou não
             return None
     
     def _cancel_order_sync(self, order_id: str) -> bool:
@@ -346,8 +346,7 @@ class MarketMakerV2:
             self.client.cancel(order_id)
             return True
         except Exception as e:
-            # Pode falhar se já foi executada
-            print(f"⚠️ Erro ao cancelar ordem {order_id[:8]}...: {e}")
+            # Retorna False, quem chamou decide se printa
             return False
     
     def _cancel_all_orders_sync(self):
@@ -361,8 +360,10 @@ class MarketMakerV2:
         if order_ids:
             try:
                 self.client.cancel_orders(order_ids)
+                # Print DEPOIS da ação
                 print(f"🗑️ Canceladas {len(order_ids)} ordens")
             except Exception as e:
+                # Print DEPOIS da ação
                 print(f"❌ Erro ao cancelar ordens: {e}")
     
     # ========== LOOP PRINCIPAL DE FISCALIZAÇÃO ==========
@@ -426,22 +427,22 @@ class MarketMakerV2:
         if self.bid_order.state == OrderState.ACTIVE:
             # Tem ordem ativa - verifica se precisa cancelar
             if not should_quote_bid or self.should_cancel_bid(self.bid_order.price):
-                # Precisa cancelar
-                self.bid_order.state = OrderState.CANCELLING
-                print(f"🔄 Cancelando BID @ {self.bid_order.price:.2f} (pred={self.price_pred:.4f}, pos={pos:.1f})")
+                # Precisa cancelar - guarda info para print DEPOIS
+                old_price = self.bid_order.price
+                old_pred = self.price_pred
                 
+                self.bid_order.state = OrderState.CANCELLING
                 success = await asyncio.to_thread(
                     self._cancel_order_sync, 
                     self.bid_order.order_id
                 )
+                self.bid_order = OrderInfo()
                 
+                # Print DEPOIS da ação
                 if success:
-                    self.bid_order = OrderInfo()
-                    print("✅ BID cancelado")
+                    print(f"✅ BID cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
                 else:
-                    # Falhou ao cancelar - pode ter sido executado
-                    self.bid_order = OrderInfo()
-                    print("⚠️ BID: falha ao cancelar (pode ter sido executado)")
+                    print(f"⚠️ BID: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
         
         elif self.bid_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -465,6 +466,7 @@ class MarketMakerV2:
                         size=TRADE_SIZE,
                         state=OrderState.ACTIVE
                     )
+                    # Print DEPOIS da ação
                     print(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _fiscalize_ask(self):
@@ -487,22 +489,22 @@ class MarketMakerV2:
             # Tem ordem ativa - verifica se precisa cancelar
             # ask_order.price guarda o preço do ASK (YES), não do NO
             if not should_quote_ask or self.should_cancel_ask(self.ask_order.price):
-                # Precisa cancelar
-                self.ask_order.state = OrderState.CANCELLING
-                print(f"🔄 Cancelando ASK @ {self.ask_order.price:.2f} (pred={self.price_pred:.4f}, pos={pos:.1f})")
+                # Precisa cancelar - guarda info para print DEPOIS
+                old_price = self.ask_order.price
+                old_pred = self.price_pred
                 
+                self.ask_order.state = OrderState.CANCELLING
                 success = await asyncio.to_thread(
                     self._cancel_order_sync, 
                     self.ask_order.order_id
                 )
+                self.ask_order = OrderInfo()
                 
+                # Print DEPOIS da ação
                 if success:
-                    self.ask_order = OrderInfo()
-                    print("✅ ASK cancelado")
+                    print(f"✅ ASK cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
                 else:
-                    # Falhou ao cancelar - pode ter sido executado
-                    self.ask_order = OrderInfo()
-                    print("⚠️ ASK: falha ao cancelar (pode ter sido executado)")
+                    print(f"⚠️ ASK: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
         
         elif self.ask_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -526,6 +528,7 @@ class MarketMakerV2:
                         size=TRADE_SIZE,
                         state=OrderState.ACTIVE
                     )
+                    # Print DEPOIS da ação
                     print(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _cancel_all_quotes(self):
@@ -540,6 +543,7 @@ class MarketMakerV2:
             await asyncio.to_thread(self._cancel_order_sync, self.ask_order.order_id)
             self.ask_order = OrderInfo()
         
+        # Print DEPOIS da ação
         print("🗑️ Quotes canceladas (fora do horário)")
     
     # ========== EVENT HANDLERS (APENAS ATUALIZAM ESTADO) ==========
@@ -602,20 +606,27 @@ class MarketMakerV2:
         
         outcome_upper = outcome.upper() if outcome else ''
         
-        # Adquire lock para evitar race condition com fiscalize_quotes
+        # IMPORTANTE: Marca ordem como NONE imediatamente, ANTES de pegar o lock
+        # Isso evita que fiscalize_loop tente cancelar uma ordem já executada
+        # enquanto esperamos o lock
+        if side == 'BUY':
+            if outcome_upper == 'UP' and self.bid_order.state == OrderState.ACTIVE:
+                self.bid_order.state = OrderState.NONE  # Marca imediatamente
+            elif outcome_upper == 'DOWN' and self.ask_order.state == OrderState.ACTIVE:
+                self.ask_order.state = OrderState.NONE  # Marca imediatamente
+        
+        # Agora pega o lock para atualizar posição de forma segura
         async with self.order_lock:
             # Atualiza posição
             if side == 'BUY':
                 if outcome_upper == 'UP':
                     self.pos_yes += size
-                    # Se era nosso BID, limpa o estado
-                    if self.bid_order.state == OrderState.ACTIVE:
-                        self.bid_order = OrderInfo()
+                    # Limpa completamente o estado da ordem
+                    self.bid_order = OrderInfo()
                 elif outcome_upper == 'DOWN':
                     self.pos_no += size
-                    # Se era nosso ASK (compra NO), limpa o estado
-                    if self.ask_order.state == OrderState.ACTIVE:
-                        self.ask_order = OrderInfo()
+                    # Limpa completamente o estado da ordem
+                    self.ask_order = OrderInfo()
             elif side == 'SELL':
                 if outcome_upper == 'UP':
                     self.pos_yes -= size
@@ -748,11 +759,13 @@ async def read_fills(zmq_context, maker: MarketMakerV2):
         try:
             data = await socket.recv_json()
             
-            if first_msg:
-                print(f"✅ Primeiro fill recebido: {data}")
-                first_msg = False
-            
+            # IMPORTANTE: Processa o fill ANTES de qualquer outra coisa
+            # para evitar race condition com fiscalize_loop
             await maker.on_fill(data)
+            
+            if first_msg:
+                print(f"✅ Primeiro fill processado")
+                first_msg = False
         
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
