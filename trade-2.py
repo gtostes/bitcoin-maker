@@ -55,8 +55,8 @@ IPC_FILLS = "ipc:///tmp/polymarket_fills.ipc"     # Recebe fills do User Channel
 TRADE_SIZE = 5            # Tamanho de cada quote
 MAX_POSITION = 25         # Posição máxima (YES - NO)
 SPREAD_QUOTE = 0.04       # Spread para colocar quote (4 cents cada lado)
-SPREAD_CANCEL = 0.015     # Distância máxima da quote ideal para cancelar
-SKEW_FACTOR = 0.002       # Fator de skew por unidade de posição
+SPREAD_CANCEL = 0.018     # Distância máxima da quote ideal para cancelar
+SKEW_FACTOR = 0.0024       # Fator de skew por unidade de posição
 MAX_DISTANCE = 0.10       # Distância máxima do mercado para cancelar (10 cents)
 
 # Intervalos de tempo
@@ -67,6 +67,47 @@ WARMUP_SECONDS = 30       # Tempo mínimo de warmup após iniciar (30s)
 
 # Tick size do Polymarket
 TICK_SIZE = Decimal("0.01")
+
+
+# ============================================================
+# ASYNC PRINT (não bloqueia o event loop)
+# ============================================================
+
+_print_queue: asyncio.Queue = None
+
+def aprint(msg: str):
+    """
+    Print assíncrono - enfileira a mensagem para ser printada por uma task separada.
+    NUNCA bloqueia a função que chamou.
+    """
+    global _print_queue
+    if _print_queue is not None:
+        try:
+            _print_queue.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass  # Descarta se a fila estiver cheia (evita bloqueio)
+
+async def _print_worker():
+    """Worker que processa a fila de prints em background."""
+    global _print_queue
+    _print_queue = asyncio.Queue(maxsize=1000)
+    
+    while True:
+        try:
+            msg = await _print_queue.get()
+            print(msg)
+            _print_queue.task_done()
+        except asyncio.CancelledError:
+            # Drena a fila antes de sair
+            while not _print_queue.empty():
+                try:
+                    msg = _print_queue.get_nowait()
+                    print(msg)
+                except asyncio.QueueEmpty:
+                    break
+            break
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -112,7 +153,7 @@ def get_current_token_ids():
         markets = get_markets(url)
         
         if not markets:
-            print(f"❌ Nenhum mercado encontrado para {url}")
+            aprint(f"❌ Nenhum mercado encontrado para {url}")
             return None, None
         
         ids = re.findall(r'"(\d+)"', markets[0]['clobTokenIds'])
@@ -120,14 +161,14 @@ def get_current_token_ids():
         if len(ids) >= 2:
             token_id_yes = ids[0]
             token_id_no = ids[1]
-            print(f"✅ Token IDs: YES={token_id_yes[:20]}... | NO={token_id_no[:20]}...")
+            aprint(f"✅ Token IDs: YES={token_id_yes[:20]}... | NO={token_id_no[:20]}...")
             return token_id_yes, token_id_no
         else:
-            print(f"❌ Token IDs insuficientes: {ids}")
+            aprint(f"❌ Token IDs insuficientes: {ids}")
             return None, None
             
     except Exception as e:
-        print(f"❌ Erro ao buscar token IDs: {e}")
+        aprint(f"❌ Erro ao buscar token IDs: {e}")
         return None, None
 
 
@@ -204,7 +245,7 @@ class MarketMakerV2:
     def reset_period(self):
         """Reset para novo período de 15min"""
         if self.price_15 is not None:
-            print(f"📊 Período encerrado | Posição: YES={self.pos_yes:.2f} NO={self.pos_no:.2f}")
+            aprint(f"📊 Período encerrado | Posição: YES={self.pos_yes:.2f} NO={self.pos_no:.2f}")
         
         # Cancela ordens pendentes
         self._cancel_all_orders_sync()
@@ -215,7 +256,7 @@ class MarketMakerV2:
         self.bid_order = OrderInfo()
         self.ask_order = OrderInfo()
         
-        print("🔄 Reset para novo período")
+        aprint("🔄 Reset para novo período")
     
     def _can_trade(self) -> bool:
         """Verifica se pode operar no momento atual"""
@@ -361,10 +402,10 @@ class MarketMakerV2:
             try:
                 self.client.cancel_orders(order_ids)
                 # Print DEPOIS da ação
-                print(f"🗑️ Canceladas {len(order_ids)} ordens")
+                aprint(f"🗑️ Canceladas {len(order_ids)} ordens")
             except Exception as e:
                 # Print DEPOIS da ação
-                print(f"❌ Erro ao cancelar ordens: {e}")
+                aprint(f"❌ Erro ao cancelar ordens: {e}")
     
     # ========== LOOP PRINCIPAL DE FISCALIZAÇÃO ==========
     
@@ -373,7 +414,7 @@ class MarketMakerV2:
         Loop principal que fiscaliza as quotes a cada 0.2s.
         Este é o ÚNICO lugar que decide colocar/cancelar ordens.
         """
-        print("🔍 Iniciando loop de fiscalização...")
+        aprint("🔍 Iniciando loop de fiscalização...")
         
         while True:
             try:
@@ -382,7 +423,7 @@ class MarketMakerV2:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"❌ Erro no loop de fiscalização: {e}")
+                aprint(f"❌ Erro no loop de fiscalização: {e}")
                 await asyncio.sleep(0.5)
     
     async def _fiscalize_quotes(self):
@@ -440,9 +481,9 @@ class MarketMakerV2:
                 
                 # Print DEPOIS da ação
                 if success:
-                    print(f"✅ BID cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
+                    aprint(f"✅ BID cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
                 else:
-                    print(f"⚠️ BID: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
+                    aprint(f"⚠️ BID: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
         
         elif self.bid_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -467,7 +508,7 @@ class MarketMakerV2:
                         state=OrderState.ACTIVE
                     )
                     # Print DEPOIS da ação
-                    print(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                    aprint(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _fiscalize_ask(self):
         """Fiscaliza e ajusta o ASK (vender YES via comprar NO)"""
@@ -502,9 +543,9 @@ class MarketMakerV2:
                 
                 # Print DEPOIS da ação
                 if success:
-                    print(f"✅ ASK cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
+                    aprint(f"✅ ASK cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f})")
                 else:
-                    print(f"⚠️ ASK: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
+                    aprint(f"⚠️ ASK: falha ao cancelar @ {old_price:.2f} (pode ter sido executado)")
         
         elif self.ask_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -529,7 +570,7 @@ class MarketMakerV2:
                         state=OrderState.ACTIVE
                     )
                     # Print DEPOIS da ação
-                    print(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                    aprint(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _cancel_all_quotes(self):
         """Cancela todas as quotes (usado quando sai do horário de trading)"""
@@ -544,7 +585,7 @@ class MarketMakerV2:
             self.ask_order = OrderInfo()
         
         # Print DEPOIS da ação
-        print("🗑️ Quotes canceladas (fora do horário)")
+        aprint("🗑️ Quotes canceladas (fora do horário)")
     
     # ========== EVENT HANDLERS (APENAS ATUALIZAM ESTADO) ==========
     
@@ -570,7 +611,7 @@ class MarketMakerV2:
         if self.price_15 is None:
             # Primeiro price_15 recebido - apenas salva
             self.price_15 = new_price_15
-            print(f"📊 Primeiro price_15 recebido: {new_price_15}")
+            aprint(f"📊 Primeiro price_15 recebido: {new_price_15}")
             return
         
         if new_price_15 != self.price_15:
@@ -580,17 +621,17 @@ class MarketMakerV2:
             # Calcula PnL do período
             if new_price_15 > old_price:
                 period_pnl = self.pos_yes
-                print(f"📈 Preço subiu! YES ganha. PnL período: +{period_pnl:.2f}")
+                aprint(f"📈 Preço subiu! YES ganha. PnL período: +{period_pnl:.2f}")
             else:
                 period_pnl = self.pos_no
-                print(f"📉 Preço caiu! NO ganha. PnL período: +{period_pnl:.2f}")
+                aprint(f"📉 Preço caiu! NO ganha. PnL período: +{period_pnl:.2f}")
             
             self.pnl += period_pnl
-            print(f"💰 PnL total: {self.pnl:.2f}")
+            aprint(f"💰 PnL total: {self.pnl:.2f}")
             
             # Reset e atualiza token IDs
             self.reset_period()
-            print("\n🔄 Novo período! Renovando token IDs...")
+            aprint("\n🔄 Novo período! Renovando token IDs...")
             self.update_token_ids()
     
     async def on_fill(self, fill_data: dict):
@@ -636,8 +677,8 @@ class MarketMakerV2:
             self.total_traded += size
         
         maker_str = "MAKER" if is_maker else "TAKER"
-        print(f"💰 FILL [{maker_str}]: {side} {size} {outcome} @ {price:.4f}")
-        print(f"📊 Posição: YES={self.pos_yes:.2f} | NO={self.pos_no:.2f}")
+        aprint(f"💰 FILL [{maker_str}]: {side} {size} {outcome} @ {price:.4f}")
+        aprint(f"📊 Posição: YES={self.pos_yes:.2f} | NO={self.pos_no:.2f}")
 
 
 # ============================================================
@@ -648,7 +689,7 @@ async def read_price_pred(zmq_context, maker: MarketMakerV2):
     """Lê price_pred (pred_model2) do process-bitcoin-price.py"""
     socket = zmq_context.socket(zmq.PULL)
     socket.connect(IPC_PRICE_PRED)
-    print(f"🔌 Conectado ao IPC price_pred: {IPC_PRICE_PRED}")
+    aprint(f"🔌 Conectado ao IPC price_pred: {IPC_PRICE_PRED}")
     
     first_msg = True
     while True:
@@ -658,7 +699,7 @@ async def read_price_pred(zmq_context, maker: MarketMakerV2):
             if first_msg:
                 pred = data.get('pred_model2')
                 pred_str = f"{pred:.4f}" if pred is not None else "N/A"
-                print(f"✅ Primeiro price_pred: {pred_str}")
+                aprint(f"✅ Primeiro price_pred: {pred_str}")
                 first_msg = False
             
             maker.on_price_pred(data)
@@ -666,12 +707,12 @@ async def read_price_pred(zmq_context, maker: MarketMakerV2):
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
                 break
-            print(f"❌ Erro ZMQ price_pred: {e}")
+            aprint(f"❌ Erro ZMQ price_pred: {e}")
             await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"❌ Erro price_pred: {e}")
+            aprint(f"❌ Erro price_pred: {e}")
             await asyncio.sleep(0.1)
     
     socket.close()
@@ -681,7 +722,7 @@ async def read_bid_ask(zmq_context, maker: MarketMakerV2):
     """Lê bid/ask do market-user-stream.py"""
     socket = zmq_context.socket(zmq.PULL)
     socket.connect(IPC_MARKET)
-    print(f"🔌 Conectado ao IPC mercado: {IPC_MARKET}")
+    aprint(f"🔌 Conectado ao IPC mercado: {IPC_MARKET}")
     
     first_msg = True
     
@@ -697,7 +738,7 @@ async def read_bid_ask(zmq_context, maker: MarketMakerV2):
                     break
             
             if first_msg and "best_bid" in data:
-                print(f"✅ Primeiro bid/ask: bid={data['best_bid']} | ask={data['best_ask']}")
+                aprint(f"✅ Primeiro bid/ask: bid={data['best_bid']} | ask={data['best_ask']}")
                 first_msg = False
             
             maker.on_bid_ask(data)
@@ -705,12 +746,12 @@ async def read_bid_ask(zmq_context, maker: MarketMakerV2):
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
                 break
-            print(f"❌ Erro ZMQ bid/ask: {e}")
+            aprint(f"❌ Erro ZMQ bid/ask: {e}")
             await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"❌ Erro bid/ask: {e}")
+            aprint(f"❌ Erro bid/ask: {e}")
             await asyncio.sleep(0.1)
     
     socket.close()
@@ -721,7 +762,7 @@ async def read_price_15(zmq_context, maker: MarketMakerV2):
     socket = zmq_context.socket(zmq.SUB)
     socket.connect(IPC_PRICE15)
     socket.setsockopt_string(zmq.SUBSCRIBE, "")
-    print(f"🔌 Conectado ao IPC price_15: {IPC_PRICE15}")
+    aprint(f"🔌 Conectado ao IPC price_15: {IPC_PRICE15}")
     
     first_msg = True
     while True:
@@ -730,19 +771,19 @@ async def read_price_15(zmq_context, maker: MarketMakerV2):
             
             if "price_15" in data:
                 if first_msg:
-                    print(f"✅ Primeiro price_15: {data['price_15']}")
+                    aprint(f"✅ Primeiro price_15: {data['price_15']}")
                     first_msg = False
                 maker.on_price_15(data["price_15"])
         
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
                 break
-            print(f"❌ Erro ZMQ price_15: {e}")
+            aprint(f"❌ Erro ZMQ price_15: {e}")
             await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"❌ Erro price_15: {e}")
+            aprint(f"❌ Erro price_15: {e}")
             await asyncio.sleep(0.1)
     
     socket.close()
@@ -752,7 +793,7 @@ async def read_fills(zmq_context, maker: MarketMakerV2):
     """Lê fills do market-user-stream.py"""
     socket = zmq_context.socket(zmq.PULL)
     socket.connect(IPC_FILLS)
-    print(f"🔌 Conectado ao IPC fills: {IPC_FILLS}")
+    aprint(f"🔌 Conectado ao IPC fills: {IPC_FILLS}")
     
     first_msg = True
     while True:
@@ -764,18 +805,18 @@ async def read_fills(zmq_context, maker: MarketMakerV2):
             await maker.on_fill(data)
             
             if first_msg:
-                print(f"✅ Primeiro fill processado")
+                aprint(f"✅ Primeiro fill processado")
                 first_msg = False
         
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
                 break
-            print(f"❌ Erro ZMQ fills: {e}")
+            aprint(f"❌ Erro ZMQ fills: {e}")
             await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"❌ Erro fills: {e}")
+            aprint(f"❌ Erro fills: {e}")
             await asyncio.sleep(0.1)
     
     socket.close()
@@ -807,7 +848,7 @@ async def status_printer(maker: MarketMakerV2):
             mkt_bid_str = f"{maker.best_bid:.2f}" if maker.best_bid else "N/A"
             mkt_ask_str = f"{maker.best_ask:.2f}" if maker.best_ask else "N/A"
             
-            print(
+            aprint(
                 f"📊 pred={maker.price_pred:.4f} | "
                 f"mkt: {mkt_bid_str}/{mkt_ask_str} | "
                 f"quotes: {bid_status}/{ask_status} | "
@@ -862,6 +903,7 @@ async def main():
     print("\n⏳ Aguardando dados...\n")
     
     tasks = [
+        asyncio.create_task(_print_worker()),  # Print assíncrono (deve ser o primeiro!)
         asyncio.create_task(read_price_pred(zmq_context, maker)),
         asyncio.create_task(read_bid_ask(zmq_context, maker)),
         asyncio.create_task(read_price_15(zmq_context, maker)),
@@ -873,16 +915,16 @@ async def main():
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        print("\n👋 Encerrando...")
+        aprint("\n👋 Encerrando...")
     finally:
-        print("🗑️ Cancelando ordens pendentes...")
+        aprint("🗑️ Cancelando ordens pendentes...")
         maker._cancel_all_orders_sync()
         
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         zmq_context.term()
-        print("✅ Encerrado!")
+        print("✅ Encerrado!")  # Este pode ser print normal pois é o último
 
 
 if __name__ == "__main__":
