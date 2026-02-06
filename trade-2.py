@@ -63,6 +63,7 @@ MAX_DISTANCE = 0.10       # Distância máxima do mercado para cancelar (10 cent
 FISCALIZE_INTERVAL = 0.2  # Fiscaliza quotes a cada 200ms
 NO_TRADE_START = 0.5      # Não opera nos primeiros 30s (0.5 min)
 NO_TRADE_END = 14.5       # Não opera depois de 14:30 (14.5 min)
+WARMUP_SECONDS = 30       # Tempo mínimo de warmup após iniciar (30s)
 
 # Tick size do Polymarket
 TICK_SIZE = Decimal("0.01")
@@ -145,11 +146,9 @@ class OrderState(Enum):
 class OrderInfo:
     """Informações de uma ordem"""
     order_id: str = None
-    price: float = None       # Preço em termos de YES (bid/ask do YES)
+    price: float = None
     size: float = None
     state: OrderState = OrderState.NONE
-    token: str = None         # 'YES' ou 'NO' - qual token foi usado
-    side: str = None          # 'BUY' ou 'SELL'
 
 
 # ============================================================
@@ -183,8 +182,7 @@ class MarketMakerV2:
         self.total_traded = 0.0
         
         # Estado de controle
-        self.period_start_time = None
-        self.first_period = True
+        self.bot_start_time = time.time()  # Tempo que o bot iniciou
         
         # Lock para operações de ordem (evita race conditions)
         self.order_lock = asyncio.Lock()
@@ -216,16 +214,13 @@ class MarketMakerV2:
         self.pos_no = 0.0
         self.bid_order = OrderInfo()
         self.ask_order = OrderInfo()
-        self.period_start_time = time.time()
-        self.first_period = False
         
         print("🔄 Reset para novo período")
     
     def _can_trade(self) -> bool:
         """Verifica se pode operar no momento atual"""
-        if self.first_period:
-            return False
-        if self.period_start_time is None:
+        # Espera warmup mínimo de 30s após iniciar o bot
+        if time.time() - self.bot_start_time < WARMUP_SECONDS:
             return False
         
         tm_seconds = time.time() % 900
@@ -416,12 +411,7 @@ class MarketMakerV2:
             await self._fiscalize_ask()
     
     async def _fiscalize_bid(self):
-        """
-        Fiscaliza e ajusta o BID (comprar YES ou vender NO).
-        
-        NETTING: Se tenho posição em NO, vendo NO em vez de comprar YES.
-        - Comprar YES @ price = Vender NO @ (1-price)
-        """
+        """Fiscaliza e ajusta o BID (comprar YES)"""
         pos = self.position
         desired_bid = self.calculate_bid_price()
         
@@ -460,57 +450,25 @@ class MarketMakerV2:
         elif self.bid_order.state == OrderState.NONE:
             # Sem ordem - verifica se deve colocar
             if should_quote_bid:
-                # NETTING: Se tenho NO, vendo NO em vez de comprar YES
-                if self.pos_no >= TRADE_SIZE:
-                    # Vender NO @ (1 - desired_bid)
-                    sell_no_price = round_price_up(1 - desired_bid)
-                    if sell_no_price > 0 and sell_no_price < 1:
-                        order_id = await asyncio.to_thread(
-                            self._place_order_sync,
-                            self.token_id_no,
-                            sell_no_price,
-                            TRADE_SIZE,
-                            SELL
-                        )
-                        
-                        if order_id:
-                            self.bid_order = OrderInfo(
-                                order_id=order_id,
-                                price=desired_bid,
-                                size=TRADE_SIZE,
-                                state=OrderState.ACTIVE,
-                                token='NO',
-                                side='SELL'
-                            )
-                            print(f"📝 BID via SELL NO @ {sell_no_price:.2f} (bid={desired_bid:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
-                else:
-                    # Comprar YES normalmente
-                    order_id = await asyncio.to_thread(
-                        self._place_order_sync,
-                        self.token_id_yes,
-                        desired_bid,
-                        TRADE_SIZE,
-                        BUY
+                order_id = await asyncio.to_thread(
+                    self._place_order_sync,
+                    self.token_id_yes,
+                    desired_bid,
+                    TRADE_SIZE,
+                    BUY
+                )
+                
+                if order_id:
+                    self.bid_order = OrderInfo(
+                        order_id=order_id,
+                        price=desired_bid,
+                        size=TRADE_SIZE,
+                        state=OrderState.ACTIVE
                     )
-                    
-                    if order_id:
-                        self.bid_order = OrderInfo(
-                            order_id=order_id,
-                            price=desired_bid,
-                            size=TRADE_SIZE,
-                            state=OrderState.ACTIVE,
-                            token='YES',
-                            side='BUY'
-                        )
-                        print(f"📝 BID BUY YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
+                    print(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _fiscalize_ask(self):
-        """
-        Fiscaliza e ajusta o ASK (vender YES ou comprar NO).
-        
-        NETTING: Se tenho posição em YES, vendo YES em vez de comprar NO.
-        - Vender YES @ price = Comprar NO @ (1-price)
-        """
+        """Fiscaliza e ajusta o ASK (vender YES via comprar NO)"""
         pos = self.position
         desired_ask = self.calculate_ask_price()
         
@@ -522,9 +480,12 @@ class MarketMakerV2:
             if desired_ask > self.best_ask + MAX_DISTANCE:
                 should_quote_ask = False
         
+        # Preço do NO = 1 - ask_price
+        no_price = round_price_down(1 - desired_ask) if desired_ask else None
+        
         if self.ask_order.state == OrderState.ACTIVE:
             # Tem ordem ativa - verifica se precisa cancelar
-            # ask_order.price guarda o preço do ASK (YES)
+            # ask_order.price guarda o preço do ASK (YES), não do NO
             if not should_quote_ask or self.should_cancel_ask(self.ask_order.price):
                 # Precisa cancelar
                 self.ask_order.state = OrderState.CANCELLING
@@ -549,51 +510,23 @@ class MarketMakerV2:
         
         elif self.ask_order.state == OrderState.NONE:
             # Sem ordem - verifica se deve colocar
-            if should_quote_ask:
-                # NETTING: Se tenho YES, vendo YES em vez de comprar NO
-                if self.pos_yes >= TRADE_SIZE:
-                    # Vender YES @ desired_ask
-                    if desired_ask > 0 and desired_ask < 1:
-                        order_id = await asyncio.to_thread(
-                            self._place_order_sync,
-                            self.token_id_yes,
-                            desired_ask,
-                            TRADE_SIZE,
-                            SELL
-                        )
-                        
-                        if order_id:
-                            self.ask_order = OrderInfo(
-                                order_id=order_id,
-                                price=desired_ask,
-                                size=TRADE_SIZE,
-                                state=OrderState.ACTIVE,
-                                token='YES',
-                                side='SELL'
-                            )
-                            print(f"📝 ASK SELL YES @ {desired_ask:.2f} | pos={pos:.1f} | pred={self.price_pred:.4f}")
-                else:
-                    # Comprar NO @ (1 - desired_ask)
-                    no_price = round_price_down(1 - desired_ask)
-                    if no_price > 0 and no_price < 1:
-                        order_id = await asyncio.to_thread(
-                            self._place_order_sync,
-                            self.token_id_no,
-                            no_price,
-                            TRADE_SIZE,
-                            BUY
-                        )
-                        
-                        if order_id:
-                            self.ask_order = OrderInfo(
-                                order_id=order_id,
-                                price=desired_ask,  # Guarda o preço do ASK (YES)
-                                size=TRADE_SIZE,
-                                state=OrderState.ACTIVE,
-                                token='NO',
-                                side='BUY'
-                            )
-                            print(f"📝 ASK via BUY NO @ {no_price:.2f} (ask={desired_ask:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
+            if should_quote_ask and no_price is not None and no_price > 0:
+                order_id = await asyncio.to_thread(
+                    self._place_order_sync,
+                    self.token_id_no,
+                    no_price,
+                    TRADE_SIZE,
+                    BUY
+                )
+                
+                if order_id:
+                    self.ask_order = OrderInfo(
+                        order_id=order_id,
+                        price=desired_ask,  # Guarda o preço do ASK (YES)
+                        size=TRADE_SIZE,
+                        state=OrderState.ACTIVE
+                    )
+                    print(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={self.price_pred:.4f}")
     
     async def _cancel_all_quotes(self):
         """Cancela todas as quotes (usado quando sai do horário de trading)"""
@@ -631,8 +564,9 @@ class MarketMakerV2:
     def on_price_15(self, new_price_15: float):
         """Processa atualização do price_15 (detecta mudança de período)"""
         if self.price_15 is None:
+            # Primeiro price_15 recebido - apenas salva
             self.price_15 = new_price_15
-            print(f"📊 Primeiro período detectado (price_15={new_price_15}). Aguardando próximo período.")
+            print(f"📊 Primeiro price_15 recebido: {new_price_15}")
             return
         
         if new_price_15 != self.price_15:
@@ -670,34 +604,23 @@ class MarketMakerV2:
         
         # Adquire lock para evitar race condition com fiscalize_quotes
         async with self.order_lock:
-            # Atualiza posição baseado no fill
+            # Atualiza posição
             if side == 'BUY':
                 if outcome_upper == 'UP':
                     self.pos_yes += size
+                    # Se era nosso BID, limpa o estado
+                    if self.bid_order.state == OrderState.ACTIVE:
+                        self.bid_order = OrderInfo()
                 elif outcome_upper == 'DOWN':
                     self.pos_no += size
+                    # Se era nosso ASK (compra NO), limpa o estado
+                    if self.ask_order.state == OrderState.ACTIVE:
+                        self.ask_order = OrderInfo()
             elif side == 'SELL':
                 if outcome_upper == 'UP':
                     self.pos_yes -= size
                 elif outcome_upper == 'DOWN':
                     self.pos_no -= size
-            
-            # Limpa estado das ordens baseado no fill
-            # BID pode ser: BUY YES ou SELL NO
-            if self.bid_order.state == OrderState.ACTIVE:
-                if ((self.bid_order.token == 'YES' and self.bid_order.side == 'BUY' and 
-                     side == 'BUY' and outcome_upper == 'UP') or
-                    (self.bid_order.token == 'NO' and self.bid_order.side == 'SELL' and 
-                     side == 'SELL' and outcome_upper == 'DOWN')):
-                    self.bid_order = OrderInfo()
-            
-            # ASK pode ser: SELL YES ou BUY NO
-            if self.ask_order.state == OrderState.ACTIVE:
-                if ((self.ask_order.token == 'YES' and self.ask_order.side == 'SELL' and 
-                     side == 'SELL' and outcome_upper == 'UP') or
-                    (self.ask_order.token == 'NO' and self.ask_order.side == 'BUY' and 
-                     side == 'BUY' and outcome_upper == 'DOWN')):
-                    self.ask_order = OrderInfo()
             
             self.total_traded += size
         
@@ -857,18 +780,9 @@ async def status_printer(maker: MarketMakerV2):
             
             can_trade = "✅" if maker._can_trade() else "❌"
             
-            # Status das ordens (inclui tipo: BUY/SELL token)
-            if maker.bid_order.state == OrderState.ACTIVE:
-                bid_type = f"{maker.bid_order.side[0]}{maker.bid_order.token[0]}" if maker.bid_order.side else "?"
-                bid_status = f"BID@{maker.bid_order.price:.2f}({bid_type})"
-            else:
-                bid_status = "---"
-            
-            if maker.ask_order.state == OrderState.ACTIVE:
-                ask_type = f"{maker.ask_order.side[0]}{maker.ask_order.token[0]}" if maker.ask_order.side else "?"
-                ask_status = f"ASK@{maker.ask_order.price:.2f}({ask_type})"
-            else:
-                ask_status = "---"
+            # Status das ordens
+            bid_status = f"BID@{maker.bid_order.price:.2f}" if maker.bid_order.state == OrderState.ACTIVE else "---"
+            ask_status = f"ASK@{maker.ask_order.price:.2f}" if maker.ask_order.state == OrderState.ACTIVE else "---"
             
             # Preços desejados
             desired_bid = maker.calculate_bid_price()
