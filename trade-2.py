@@ -53,14 +53,14 @@ IPC_FILLS = "ipc:///tmp/polymarket_fills.ipc"     # Recebe fills do User Channel
 
 # Parâmetros de trading
 TRADE_SIZE = 5            # Tamanho de cada quote
-MAX_POSITION = 25         # Posição máxima (YES - NO)
+MAX_POSITION = 20         # Posição máxima (YES - NO)
 SPREAD_QUOTE = 0.04       # Spread para colocar quote (4 cents cada lado)
-SPREAD_CANCEL = 0.018     # Distância máxima da quote ideal para cancelar
+SPREAD_CANCEL = 0.015     # Distância máxima da quote ideal para cancelar
 SKEW_FACTOR = 0.0024       # Fator de skew por unidade de posição
 MAX_DISTANCE = 0.10       # Distância máxima do mercado para cancelar (10 cents)
 
 # Intervalos de tempo
-FISCALIZE_INTERVAL = 0.2  # Fiscaliza quotes a cada 200ms
+FISCALIZE_INTERVAL = 0.250  # Fiscaliza quotes a cada 250ms
 NO_TRADE_START = 0.5      # Não opera nos primeiros 30s (0.5 min)
 NO_TRADE_END = 14.5       # Não opera depois de 14:30 (14.5 min)
 WARMUP_SECONDS = 30       # Tempo mínimo de warmup após iniciar (30s)
@@ -509,10 +509,14 @@ class MarketMakerV2:
                 self.stats["orders_created"] += 1
                 
                 return order_id
+            
+            aprint(f"⚠️ Place order: resposta sem orderID: {resp}")
             return None
             
         except Exception as e:
-            aprint(f"⚠️ Place order exception: {e}")
+            # Log do erro, mas ordem pode ter sido colocada no servidor!
+            # O auditor de ordens vai detectar órfãs se isso acontecer
+            aprint(f"⚠️ Place order exception (ordem pode ter sido colocada!): {e}")
             return None
     
     def _cancel_order_sync(self, order_id: str) -> tuple[bool, str]:
@@ -665,17 +669,19 @@ class MarketMakerV2:
                 old_filled = self.bid_order.filled_size
                 
                 self.bid_order.state = OrderState.CANCELLING
+                t0 = time.perf_counter()
                 success, reason = await asyncio.to_thread(
                     self._cancel_order_sync, 
                     self.bid_order.order_id
                 )
+                latency_ms = (time.perf_counter() - t0) * 1000
                 self.bid_order = OrderInfo()
                 
                 # Print DEPOIS da ação
                 if success:
-                    aprint(f"✅ BID cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f}, filled={old_filled:.1f})")
+                    aprint(f"✅ BID cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f}, filled={old_filled:.1f}) | lat={latency_ms:.0f}ms")
                 else:
-                    aprint(f"⚠️ BID cancel failed @ {old_price:.2f} reason={reason} (filled={old_filled:.1f})")
+                    aprint(f"⚠️ BID cancel failed @ {old_price:.2f} reason={reason} (filled={old_filled:.1f}) | lat={latency_ms:.0f}ms")
         
         elif self.bid_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -687,6 +693,7 @@ class MarketMakerV2:
                 # Guarda pred ANTES do await (pode mudar durante a chamada)
                 pred_at_order = self.price_pred
                 
+                t0 = time.perf_counter()
                 order_id = await asyncio.to_thread(
                     self._place_order_sync,
                     self.token_id_yes,
@@ -695,6 +702,7 @@ class MarketMakerV2:
                     BUY,
                     "BID"  # order_side para tracking
                 )
+                latency_ms = (time.perf_counter() - t0) * 1000
                 
                 if order_id:
                     self.bid_order = OrderInfo(
@@ -705,7 +713,7 @@ class MarketMakerV2:
                         state=OrderState.ACTIVE
                     )
                     # Print DEPOIS da ação (com pred do momento da decisão)
-                    aprint(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={pred_at_order:.4f} | id={order_id[:16]}...")
+                    aprint(f"📝 BID YES @ {desired_bid:.2f} | pos={pos:.1f} | pred={pred_at_order:.4f} | id={order_id[:16]}... | lat={latency_ms:.0f}ms")
     
     async def _fiscalize_ask(self):
         """Fiscaliza e ajusta o ASK (vender YES via comprar NO)"""
@@ -739,17 +747,19 @@ class MarketMakerV2:
                 old_filled = self.ask_order.filled_size
                 
                 self.ask_order.state = OrderState.CANCELLING
+                t0 = time.perf_counter()
                 success, reason = await asyncio.to_thread(
                     self._cancel_order_sync, 
                     self.ask_order.order_id
                 )
+                latency_ms = (time.perf_counter() - t0) * 1000
                 self.ask_order = OrderInfo()
                 
                 # Print DEPOIS da ação
                 if success:
-                    aprint(f"✅ ASK cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f}, filled={old_filled:.1f})")
+                    aprint(f"✅ ASK cancelado @ {old_price:.2f} (pred={old_pred:.4f}, pos={pos:.1f}, filled={old_filled:.1f}) | lat={latency_ms:.0f}ms")
                 else:
-                    aprint(f"⚠️ ASK cancel failed @ {old_price:.2f} reason={reason} (filled={old_filled:.1f})")
+                    aprint(f"⚠️ ASK cancel failed @ {old_price:.2f} reason={reason} (filled={old_filled:.1f}) | lat={latency_ms:.0f}ms")
         
         elif self.ask_order.state == OrderState.CANCELLING:
             # Aguardando cancelamento - não faz nada
@@ -761,6 +771,7 @@ class MarketMakerV2:
                 # Guarda pred ANTES do await (pode mudar durante a chamada)
                 pred_at_order = self.price_pred
                 
+                t0 = time.perf_counter()
                 order_id = await asyncio.to_thread(
                     self._place_order_sync,
                     self.token_id_no,
@@ -769,6 +780,7 @@ class MarketMakerV2:
                     BUY,
                     "ASK"  # order_side para tracking
                 )
+                latency_ms = (time.perf_counter() - t0) * 1000
                 
                 if order_id:
                     self.ask_order = OrderInfo(
@@ -779,7 +791,7 @@ class MarketMakerV2:
                         state=OrderState.ACTIVE
                     )
                     # Print DEPOIS da ação (com pred do momento da decisão)
-                    aprint(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={pred_at_order:.4f} | id={order_id[:16]}...")
+                    aprint(f"📝 ASK YES @ {desired_ask:.2f} (NO @ {no_price:.2f}) | pos={pos:.1f} | pred={pred_at_order:.4f} | id={order_id[:16]}... | lat={latency_ms:.0f}ms")
     
     async def _cancel_all_quotes(self):
         """Cancela todas as quotes (usado quando sai do horário de trading)"""
@@ -1111,98 +1123,6 @@ async def read_fills(zmq_context, maker: MarketMakerV2):
     socket.close()
 
 
-# ============================================================
-# AUDITOR DE ORDENS (VERIFICA ORDENS ÓRFÃS)
-# ============================================================
-
-async def order_auditor(maker: MarketMakerV2):
-    """
-    Audita ordens a cada 1s para detectar ordens órfãs.
-    Busca ordens ativas na API e compara com o estado local.
-    """
-    aprint("🔍 Iniciando auditor de ordens...")
-    
-    # Espera 5s para o bot estabilizar
-    await asyncio.sleep(5)
-    
-    while True:
-        try:
-            await asyncio.sleep(1)
-            
-            # Busca ordens ativas na API
-            # Usa token_id para filtrar apenas o mercado atual
-            active_orders = []
-            
-            if maker.token_id_yes:
-                try:
-                    params = OpenOrderParams(asset_id=maker.token_id_yes)
-                    orders_yes = await asyncio.to_thread(
-                        maker.client.get_orders,
-                        params
-                    )
-                    if orders_yes:
-                        active_orders.extend(orders_yes)
-                except Exception as e:
-                    aprint(f"⚠️ Auditor: erro ao buscar ordens YES: {e}")
-            
-            if maker.token_id_no:
-                try:
-                    params = OpenOrderParams(asset_id=maker.token_id_no)
-                    orders_no = await asyncio.to_thread(
-                        maker.client.get_orders,
-                        params
-                    )
-                    if orders_no:
-                        active_orders.extend(orders_no)
-                except Exception as e:
-                    aprint(f"⚠️ Auditor: erro ao buscar ordens NO: {e}")
-            
-            if not active_orders:
-                continue
-            
-            # IDs das ordens que conhecemos como ativas
-            known_active = set()
-            if maker.bid_order.state == OrderState.ACTIVE and maker.bid_order.order_id:
-                known_active.add(maker.bid_order.order_id)
-            if maker.ask_order.state == OrderState.ACTIVE and maker.ask_order.order_id:
-                known_active.add(maker.ask_order.order_id)
-            
-            # Verifica cada ordem ativa na API
-            for order in active_orders:
-                order_id = order.get('id') or order.get('order_id') or order.get('orderID')
-                if not order_id:
-                    continue
-                
-                # Se está ativa na API mas não conhecemos, é órfã!
-                if order_id not in known_active:
-                    price = order.get('price', 'N/A')
-                    size = order.get('size', 'N/A')
-                    side = order.get('side', 'N/A')
-                    
-                    aprint(f"🚨 ORDEM ÓRFÃ DETECTADA: {order_id[:16]}... side={side} price={price} size={size}")
-                    maker.stats["orphan_orders_found"] += 1
-                    
-                    # Tenta cancelar a ordem órfã
-                    try:
-                        aprint(f"🗑️ Cancelando ordem órfã {order_id[:16]}...")
-                        success, reason = await asyncio.to_thread(
-                            maker._cancel_order_sync,
-                            order_id
-                        )
-                        if success:
-                            aprint(f"✅ Ordem órfã cancelada: {order_id[:16]}...")
-                        else:
-                            aprint(f"❌ Falha ao cancelar órfã: {order_id[:16]}... reason={reason}")
-                    except Exception as e:
-                        aprint(f"❌ Exception ao cancelar órfã: {e}")
-        
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            aprint(f"❌ Erro no auditor: {e}")
-            await asyncio.sleep(1)
-
-
 async def queue_monitor():
     """
     Monitora o tamanho da fila de prints.
@@ -1343,7 +1263,6 @@ async def main():
         asyncio.create_task(read_price_15(zmq_context, maker)),
         asyncio.create_task(read_fills(zmq_context, maker)),
         asyncio.create_task(maker.fiscalize_loop()),  # Loop de fiscalização
-        asyncio.create_task(order_auditor(maker)),  # Auditor de ordens órfãs
         asyncio.create_task(status_printer(maker)),
     ]
     
