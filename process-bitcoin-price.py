@@ -170,6 +170,29 @@ class price_pred_model2:
         """Retorna predição do modelo 2"""
         entry = [list(self.xgb.values())]
         return model.predict(entry)[0]
+    
+    def get_prediction_with_Q(self, Q_value):
+        """Retorna predição do modelo 2 com um valor específico de Q"""
+        features = self.xgb.copy()
+        features['Q'] = Q_value
+        entry = [list(features.values())]
+        return model.predict(entry)[0]
+    
+    def get_prediction_and_dQ(self):
+        """
+        Retorna (pred, dpred_dQ) onde dpred_dQ é a derivada parcial em relação a Q.
+        Estimada via diferenças finitas: [f(Q+0.01) - f(Q-0.01)] / 0.02
+        """
+        Q = self.xgb['Q']
+        delta = 0.01
+        
+        pred = self.get_prediction()
+        pred_plus = self.get_prediction_with_Q(Q + delta)
+        pred_minus = self.get_prediction_with_Q(Q - delta)
+        
+        dpred_dQ = (pred_plus - pred_minus) / (2 * delta)
+        
+        return pred, dpred_dQ
 
 
 class BTCPriceProcessor:
@@ -265,6 +288,7 @@ class BTCPriceProcessor:
         print("🎧 Escutando preços BTC via IPC (Modelo 2 apenas)...\n")
         
         pred_model2 = None
+        dpred_dQ = None
         last_binance_second = -1  # Para controlar print de apenas 1 por segundo
         
         try:
@@ -288,7 +312,7 @@ class BTCPriceProcessor:
                     price_pred_binance = self.upd_vwap.get_prediction()
                     if price_pred_binance != -1:
                         self.model2.update_features(price_pred_binance, ts_feed)
-                        pred_model2 = self.model2.get_prediction()
+                        pred_model2, dpred_dQ = self.model2.get_prediction_and_dQ()
                 
                 # ========== CHAINLINK: Atualiza upd_vwap.insert_chainlink() ==========
                 if chainlink_price != -1:
@@ -313,6 +337,7 @@ class BTCPriceProcessor:
                 output_data = {
                     "price": price_raw,
                     "pred_model2": pred_model2,
+                    "dpred_dQ": dpred_dQ,
                     "timestamp": ts_feed,
                     "features_model2": self.model2.xgb.copy()
                 }
@@ -353,7 +378,7 @@ class BTCPriceProcessor:
                 if should_print:
                     # Formata features do modelo 2
                     f2 = self.model2.xgb
-                    f2_str = f"vol60={f2['vol_ewma_60']:.2f} vvol={f2['vol_vol_ewma_60']:.4f} regime={f2['vol_regime']:.3f} dist15={f2['distance_15']:.6f} rsi={f2['rsi_60']:.2f} Q={f2['Q']:.3f}"
+                    f2_str = f"vol60={f2['vol_ewma_60']:.2f} vvol={f2['vol_vol_ewma_60']:.4f} regime={f2['vol_regime']:.3f} dist15={f2['distance_15']:.6f} rsi={f2['rsi_60']:.2f} Q={f2['Q']:.3f} dQ={dpred_dQ:.6f}"
                     
                     print(
                         f"{src} | ts={ts_feed} | price={price_raw:.2f} | pred2={pred2_str}\n"
