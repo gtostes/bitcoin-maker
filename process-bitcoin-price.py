@@ -184,7 +184,7 @@ class price_pred_model2:
         Estimada via diferenças finitas: [f(Q+0.01) - f(Q-0.01)] / 0.02
         """
         Q = self.xgb['Q']
-        delta = 0.01
+        delta = 0.05
         
         pred = self.get_prediction()
         pred_plus = self.get_prediction_with_Q(Q + delta)
