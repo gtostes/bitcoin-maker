@@ -362,6 +362,7 @@ class BTCPriceProcessor:
                 # Log
                 src = "🔵CL" if chainlink_price != -1 else "🟡BN"
                 pred2_str = f"{pred_model2:.4f}" if pred_model2 is not None else "N/A"
+                dpred_dQ_str = f"{dpred_dQ:.6f}" if dpred_dQ is not None else "N/A"
                 
                 # Para Binance, printa apenas o primeiro de cada segundo
                 current_second = ts_feed // 1000
@@ -378,10 +379,10 @@ class BTCPriceProcessor:
                 if should_print:
                     # Formata features do modelo 2
                     f2 = self.model2.xgb
-                    f2_str = f"vol60={f2['vol_ewma_60']:.2f} vvol={f2['vol_vol_ewma_60']:.4f} regime={f2['vol_regime']:.3f} dist15={f2['distance_15']:.6f} rsi={f2['rsi_60']:.2f} Q={f2['Q']:.3f} dQ={dpred_dQ:.6f}"
+                    f2_str = f"vol60={f2['vol_ewma_60']:.2f} vvol={f2['vol_vol_ewma_60']:.4f} regime={f2['vol_regime']:.3f} dist15={f2['distance_15']:.6f} rsi={f2['rsi_60']:.2f} Q={f2['Q']:.3f}"
                     
                     print(
-                        f"{src} | ts={ts_feed} | price={price_raw:.2f} | pred2={pred2_str}\n"
+                        f"{src} | ts={ts_feed} | price={price_raw:.2f} | pred2={pred2_str} | dpred_dQ={dpred_dQ_str}\n"
                         f"     M2: {f2_str}"
                     )
                 
